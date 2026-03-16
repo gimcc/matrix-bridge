@@ -1,0 +1,24 @@
+{
+  "name": "matrix-bridge-integration-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Integration tests for the Matrix Bridge using matrix-bot-sdk with E2EE support",
+  "type": "module",
+  "scripts": {
+    "test": "tsx src/run-tests.ts",
+    "test:quick": "tsx src/run-tests.ts --quick",
+    "setup": "tsx src/setup.ts"
+  },
+  "dependencies": {
+    "matrix-bot-sdk": "^0.7.1",
+    "@matrix-org/matrix-sdk-crypto-nodejs": "^0.2.0-beta.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

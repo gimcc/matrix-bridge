@@ -1,0 +1,36 @@
+{
+  "name": "matrix-bridge-e2e",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bun test --timeout 30000",
+    "test:health": "bun test 01-health.test.ts",
+    "test:rooms": "bun test 02-room-mapping.test.ts",
+    "test:msg": "bun test 03-message-bridge.test.ts",
+    "test:outbound": "bun test 04-matrix-to-external.test.ts",
+    "test:errors": "bun test 05-error-codes.test.ts",
+    "test:exclude": "bun test 06-webhook-exclude.test.ts",
+    "test:e2ee": "bun test 07-e2ee-flow.test.ts",
+    "test:migration": "bun test 08-idempotent-migration.test.ts",
+    "test:autojoin": "bun test 09-auto-join.test.ts",
+    "test:portal": "bun test 10-portal-room.test.ts",
+    "test:media": "bun test 11-media-types.test.ts",
+    "test:redact": "bun test 12-redaction.test.ts",
+    "test:multi": "bun test 13-multi-platform.test.ts",
+    "test:commands": "bun test 14-bridge-commands.test.ts",
+    "test:resilience": "bun test 15-webhook-resilience.test.ts",
+    "test:concurrent": "bun test 16-concurrent-messages.test.ts",
+    "test:edge": "bun test 17-edge-cases.test.ts",
+    "test:multiwh": "bun test 18-webhook-multiple.test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "matrix-js-sdk": "^41.1.0"
+  }
+}
