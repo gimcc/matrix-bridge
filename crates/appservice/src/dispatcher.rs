@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
+use matrix_bridge_core::config::PermissionsConfig;
 use matrix_bridge_core::error::BridgeError;
 use matrix_bridge_core::message::{BridgeMessage, ExternalRoom, ExternalUser, MessageContent};
 use matrix_bridge_core::platform::{self, BridgePlatform};
@@ -33,6 +34,8 @@ pub struct Dispatcher {
     crypto: Option<Arc<CryptoManager>>,
     /// Whether to auto-enable encryption for rooms on link.
     encryption_default: bool,
+    /// Permission settings (invite whitelist, etc.).
+    permissions: PermissionsConfig,
 }
 
 impl Dispatcher {
@@ -43,6 +46,7 @@ impl Dispatcher {
         server_name: &str,
         sender_localpart: &str,
         puppet_prefix: &str,
+        permissions: PermissionsConfig,
     ) -> Self {
         Self {
             platforms: HashMap::new(),
@@ -54,6 +58,7 @@ impl Dispatcher {
             puppet_prefix: puppet_prefix.to_string(),
             crypto: None,
             encryption_default: false,
+            permissions,
         }
     }
 
@@ -89,6 +94,12 @@ impl Dispatcher {
         let room_id = event.get("room_id").and_then(|v| v.as_str()).unwrap_or("");
         let sender = event.get("sender").and_then(|v| v.as_str()).unwrap_or("");
 
+        // m.room.member events must be processed even when sent by the bot
+        // itself (e.g. self-invite), so check membership before the bot skip.
+        if event_type == "m.room.member" {
+            return self.handle_membership(room_id, event, crypto).await;
+        }
+
         // Skip events from the bridge bot itself (not puppet users — those need
         // cross-platform forwarding).
         if self.is_bridge_bot(sender) {
@@ -102,10 +113,13 @@ impl Dispatcher {
                     .await
             }
             "m.room.encryption" => {
-                // Track that this room is now encrypted.
+                // Track that this room is now encrypted and query member device keys.
                 if let Some(crypto) = crypto {
                     let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
                     crypto.set_room_encrypted(ruma_room_id).await?;
+                    if let Err(e) = self.update_tracked_users(room_id, crypto).await {
+                        warn!(room_id, "failed to track users on encryption event: {e}");
+                    }
                 }
                 Ok(())
             }
@@ -115,6 +129,99 @@ impl Dispatcher {
                 Ok(())
             }
         }
+    }
+
+    /// Handle m.room.member events — auto-accept invites for the bridge bot
+    /// and puppet users.
+    ///
+    /// When the bridge bot is invited to a room, it automatically joins.
+    /// This is essential because:
+    /// 1. The bot must be IN the room to receive events (messages, encryption state).
+    /// 2. E2EE requires the bot to be a member for Megolm key sharing.
+    /// 3. The `!bridge link` command can only be processed if the bot is in the room.
+    ///
+    /// For puppet users, auto-accept ensures they can send messages on behalf
+    /// of external platform users.
+    async fn handle_membership(
+        &self,
+        room_id: &str,
+        event: &Value,
+        crypto: Option<&CryptoManager>,
+    ) -> anyhow::Result<()> {
+        let membership = event
+            .get("content")
+            .and_then(|c| c.get("membership"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let state_key = event
+            .get("state_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if membership != "invite" || state_key.is_empty() {
+            return Ok(());
+        }
+
+        // Check if the invited user is the bridge bot or a puppet user.
+        let is_bot = state_key == self.bot_user_id;
+        let is_puppet = state_key.starts_with(&format!("@{}_", self.puppet_prefix));
+
+        if !is_bot && !is_puppet {
+            return Ok(());
+        }
+
+        // Check invite whitelist for both bot and puppet invites.
+        // The bridge bot itself is always allowed (it invites puppets internally).
+        let inviter = event
+            .get("sender")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let is_bridge_bot_inviting = inviter == self.bot_user_id;
+        if !is_bridge_bot_inviting && !self.permissions.is_invite_allowed(inviter) {
+            let target = if is_bot { "bot" } else { "puppet" };
+            warn!(
+                room_id,
+                inviter,
+                target,
+                "invite rejected: sender not in invite_whitelist"
+            );
+            return Ok(());
+        }
+
+        // Auto-accept the invite.
+        info!(
+            room_id,
+            invited_user = state_key,
+            is_bot,
+            "auto-accepting room invite"
+        );
+
+        if let Err(e) = self.matrix_client.join_room(room_id, state_key).await {
+            warn!(
+                room_id,
+                invited_user = state_key,
+                "failed to auto-accept invite: {e}"
+            );
+            return Ok(());
+        }
+
+        // If the bridge bot just joined an encrypted room, track device keys.
+        if is_bot {
+            if let Some(crypto) = crypto {
+                let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
+                if let Ok(ruma_room_id) = ruma_room_id {
+                    if crypto.is_room_encrypted(ruma_room_id).await {
+                        if let Err(e) = self.update_tracked_users(room_id, crypto).await {
+                            warn!(room_id, "failed to track users after bot join: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Handle an m.room.encrypted event — decrypt and process the inner event.
@@ -131,10 +238,20 @@ impl Dispatcher {
         };
 
         let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
+
+        // Ensure we have tracked all room members' devices before decrypting.
+        if let Err(e) = self.update_tracked_users(room_id, crypto).await {
+            warn!(room_id, "failed to update tracked users before decrypt: {e}");
+        }
+
+        let event_id = event.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
         let decrypted = match crypto.decrypt(ruma_room_id, event).await {
             Ok(d) => d,
             Err(e) => {
-                warn!(room_id, sender, "failed to decrypt event: {e}");
+                error!(
+                    room_id, sender, event_id,
+                    "failed to decrypt event (message will be dropped): {e}"
+                );
                 return Ok(());
             }
         };
@@ -185,6 +302,18 @@ impl Dispatcher {
         // Find all platforms that have a mapping for this room.
         let mappings = self.db.find_all_mappings_by_matrix_id(room_id).await?;
         if mappings.is_empty() {
+            return Ok(());
+        }
+
+        // Check if the sender is allowed to have messages forwarded externally.
+        // Puppet users (bridge-internal) skip this check — they relay external messages.
+        let is_puppet_sender = sender.starts_with(&format!("@{}_", self.puppet_prefix));
+        if !is_puppet_sender && !self.permissions.is_invite_allowed(sender) {
+            debug!(
+                sender,
+                room_id,
+                "message forwarding blocked: sender not in invite_whitelist"
+            );
             return Ok(());
         }
 
@@ -284,10 +413,20 @@ impl Dispatcher {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        // If the sender is a puppet user (e.g. @telegram_123:domain), extract the
-        // source platform so we skip forwarding back to it (preventing loops),
-        // while still forwarding to all OTHER platforms for cross-platform consistency.
-        let source_platform = platform::puppet_source_platform(sender, &self.puppet_prefix);
+        // Look up puppet from DB first (authoritative platform_id), then
+        // fall back to string-based extraction for unregistered puppets.
+        let puppet_record = self
+            .db
+            .find_puppet_by_matrix_id(sender)
+            .await
+            .ok()
+            .flatten();
+
+        let source_platform = puppet_record
+            .as_ref()
+            .map(|p| p.platform_id.clone())
+            .or_else(|| platform::puppet_source_platform(sender, &self.puppet_prefix));
+
         if let Some(ref p) = source_platform {
             debug!(
                 sender,
@@ -296,17 +435,7 @@ impl Dispatcher {
             );
         }
 
-        // For puppet senders, look up original identity so cross-platform
-        // forwarding carries the real sender info (not the Matrix puppet ID).
-        let original_sender = if source_platform.is_some() {
-            self.db
-                .find_puppet_by_matrix_id(sender)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
+        let original_sender = puppet_record;
 
         for mapping in &mappings {
             // Skip forwarding back to the puppet's source platform (loop prevention).
@@ -522,6 +651,50 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Ensure a puppet user can access a Matrix room.
+    ///
+    /// Flow:
+    /// 1. Try puppet join directly (works if room is public or puppet was already invited).
+    /// 2. If that fails, ensure the bridge bot is in the room first.
+    /// 3. Bridge bot invites the puppet.
+    /// 4. Puppet retries join after invite.
+    async fn ensure_room_access(
+        &self,
+        room_id: &str,
+        puppet_user_id: &str,
+    ) -> Result<(), BridgeError> {
+        // Try direct join first.
+        if self
+            .matrix_client
+            .join_room(room_id, puppet_user_id)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        // Direct join failed — ensure bridge bot is in the room.
+        debug!(room_id, puppet_user_id, "direct puppet join failed, ensuring bridge bot access");
+        self.matrix_client
+            .join_room(room_id, &self.bot_user_id)
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("bridge bot join failed: {e}")))?;
+
+        // Bridge bot invites puppet.
+        self.matrix_client
+            .invite_user(room_id, puppet_user_id)
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("invite puppet failed: {e}")))?;
+
+        // Puppet retries join after invite.
+        self.matrix_client
+            .join_room(room_id, puppet_user_id)
+            .await
+            .map_err(|e| BridgeError::Matrix(format!("puppet join after invite failed: {e}")))?;
+
+        Ok(())
+    }
+
     /// Handle an incoming message from an external platform -> Matrix.
     pub async fn handle_incoming(&self, message: BridgeMessage) -> Result<(), BridgeError> {
         let platform_id = &message.room.platform;
@@ -553,11 +726,9 @@ impl Dispatcher {
             .await
             .map_err(|e| BridgeError::Matrix(e.to_string()))?;
 
-        // Join the puppet to the room if needed.
-        self.matrix_client
-            .join_room(&room_mapping.matrix_room_id, &puppet_user_id)
-            .await
-            .map_err(|e| BridgeError::Matrix(e.to_string()))?;
+        // Ensure puppet can access the room (join, or invite+join).
+        self.ensure_room_access(&room_mapping.matrix_room_id, &puppet_user_id)
+            .await?;
 
         // Convert message content to Matrix format and send (with encryption if room is encrypted).
         let (content, txn_id) = self.to_matrix_content(&message);
@@ -676,6 +847,22 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Query device keys for all members of a room so the crypto manager
+    /// can track their devices and receive Megolm session keys.
+    async fn update_tracked_users(
+        &self,
+        room_id: &str,
+        crypto: &CryptoManager,
+    ) -> anyhow::Result<()> {
+        let members_str = self.matrix_client.get_room_members(room_id).await?;
+        let members: Vec<ruma::OwnedUserId> =
+            members_str.iter().filter_map(|m| m.parse().ok()).collect();
+        if !members.is_empty() {
+            crypto.update_tracked_users(&members).await?;
+        }
+        Ok(())
+    }
+
     /// Send a message to a Matrix room, encrypting if the room has encryption enabled.
     async fn send_to_matrix(
         &self,
@@ -742,10 +929,27 @@ impl Dispatcher {
                     .create_room_mapping(room_id, platform_id, external_id)
                     .await?;
 
+                // Ensure the bridge bot is in the room so it receives events.
+                if let Err(e) = self
+                    .matrix_client
+                    .join_room(room_id, &self.bot_user_id)
+                    .await
+                {
+                    warn!(room_id, "bridge bot failed to join linked room: {e}");
+                }
+
                 // Auto-enable encryption if configured.
                 if self.encryption_default {
                     if let Err(e) = self.enable_room_encryption(room_id).await {
                         warn!(room_id, "failed to auto-enable encryption: {e}");
+                    }
+                }
+
+                // If E2EE is active, query device keys of room members so they
+                // can share Megolm sessions with the bridge bot.
+                if let Some(crypto) = &self.crypto {
+                    if let Err(e) = self.update_tracked_users(room_id, crypto).await {
+                        warn!(room_id, "failed to update tracked users: {e}");
                     }
                 }
 
@@ -792,24 +996,80 @@ impl Dispatcher {
     ///
     /// Unlike `handle_incoming`, this does not require a registered BridgePlatform.
     /// It directly creates a puppet user and sends the message to the mapped Matrix room.
+    ///
+    /// If no room mapping exists, automatically creates a portal room (the bridge
+    /// bot is the room creator and is therefore already a member).
     pub async fn handle_incoming_http(
         &self,
         message: BridgeMessage,
     ) -> Result<String, BridgeError> {
         let platform_id = &message.room.platform;
 
-        // Find the Matrix room for this external room.
+        // Find the Matrix room for this external room, or auto-create a portal room.
         let room_mapping = self
             .db
             .find_room_by_external_id(platform_id, &message.room.external_id)
             .await
             .map_err(|e| BridgeError::Store(e.to_string()))?;
 
-        let Some(room_mapping) = room_mapping else {
-            return Err(BridgeError::NotFound(format!(
-                "no room mapping for platform={platform_id} room={}",
-                message.room.external_id
-            )));
+        let room_mapping = match room_mapping {
+            Some(m) => m,
+            None => {
+                // Auto-create a portal room. The bridge bot is the creator,
+                // so it is automatically a member — no invite/join needed.
+                let room_name = message
+                    .room
+                    .name
+                    .as_deref()
+                    .unwrap_or(&message.room.external_id);
+
+                info!(
+                    platform = platform_id,
+                    external_room = message.room.external_id,
+                    room_name,
+                    "auto-creating portal room"
+                );
+
+                let matrix_room_id = self
+                    .matrix_client
+                    .create_room(
+                        Some(room_name),
+                        &[],
+                        self.encryption_default,
+                    )
+                    .await
+                    .map_err(|e| BridgeError::Matrix(format!("portal room creation failed: {e}")))?;
+
+                // If encryption was enabled, track it in the crypto store.
+                if self.encryption_default {
+                    if let Some(crypto) = &self.crypto {
+                        if let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(matrix_room_id.as_str()) {
+                            let _ = crypto.set_room_encrypted(ruma_room_id).await;
+                        }
+                    }
+                }
+
+                // Register the room mapping.
+                let id = self
+                    .db
+                    .create_room_mapping(&matrix_room_id, platform_id, &message.room.external_id)
+                    .await
+                    .map_err(|e| BridgeError::Store(e.to_string()))?;
+
+                info!(
+                    matrix_room_id,
+                    platform = platform_id,
+                    external_room = message.room.external_id,
+                    "portal room created and mapped"
+                );
+
+                matrix_bridge_store::RoomMapping {
+                    id,
+                    matrix_room_id,
+                    platform_id: platform_id.to_string(),
+                    external_room_id: message.room.external_id.clone(),
+                }
+            }
         };
 
         // Build puppet localpart from prefix + platform + user ID.
@@ -836,11 +1096,9 @@ impl Dispatcher {
             .await
             .map_err(|e| BridgeError::Matrix(e.to_string()))?;
 
-        // Join the puppet to the room.
-        self.matrix_client
-            .join_room(&room_mapping.matrix_room_id, &puppet_user_id)
-            .await
-            .map_err(|e| BridgeError::Matrix(e.to_string()))?;
+        // Ensure puppet can access the room (join, or invite+join).
+        self.ensure_room_access(&room_mapping.matrix_room_id, &puppet_user_id)
+            .await?;
 
         // Convert and send to Matrix (with encryption if room is encrypted).
         let (content, txn_id) = self.to_matrix_content(&message);

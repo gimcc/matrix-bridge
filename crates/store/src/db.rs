@@ -44,7 +44,20 @@ impl Database {
         conn.execute_batch(include_str!(
             "migrations/003_message_mapping_multi_platform.sql"
         ))?;
-        conn.execute_batch(include_str!("migrations/004_webhook_exclude_sources.sql"))?;
+
+        // Migration 004: Add exclude_sources column (idempotent).
+        // SQLite has no "ALTER TABLE ... ADD COLUMN IF NOT EXISTS",
+        // so we check the table schema first.
+        let has_column: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('webhooks') WHERE name = 'exclude_sources'")?
+            .query_row([], |row| row.get::<_, i64>(0))
+            .map(|count| count > 0)?;
+        if !has_column {
+            conn.execute_batch(
+                "ALTER TABLE webhooks ADD COLUMN exclude_sources TEXT NOT NULL DEFAULT ''",
+            )?;
+        }
+
         info!("database migrations applied");
         Ok(())
     }

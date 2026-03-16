@@ -139,6 +139,14 @@ async fn handle_transaction(
         .handle_transaction(&events, state.crypto_manager.as_deref())
         .await;
 
+    // Flush any outgoing crypto requests generated during event processing
+    // (e.g., key queries triggered by new encrypted rooms, key claims, etc.).
+    if let Some(crypto) = &state.crypto_manager {
+        if let Err(e) = crypto.process_outgoing_requests().await {
+            error!("failed to process outgoing crypto requests: {e}");
+        }
+    }
+
     (StatusCode::OK, Json(json!({})))
 }
 

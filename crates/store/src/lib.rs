@@ -5,3 +5,4 @@ pub mod room_mapping;
 pub mod webhook_store;
 
 pub use db::Database;
+pub use room_mapping::RoomMapping;
