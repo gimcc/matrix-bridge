@@ -250,6 +250,19 @@ impl CryptoManager {
         Ok(())
     }
 
+    /// Track users so their device keys are queried and kept up-to-date.
+    ///
+    /// Call this when the bridge bot joins a room — all room members should be
+    /// tracked so we can receive Megolm session keys from their devices.
+    pub async fn update_tracked_users(&self, user_ids: &[OwnedUserId]) -> anyhow::Result<()> {
+        let refs: Vec<&UserId> = user_ids.iter().map(|u| u.as_ref()).collect();
+        self.machine.update_tracked_users(refs).await?;
+        // Process the resulting key query requests.
+        self.process_outgoing_requests().await?;
+        debug!(count = user_ids.len(), "tracked users updated");
+        Ok(())
+    }
+
     /// Get the bridge bot's device ID.
     pub fn device_id(&self) -> &ruma::DeviceId {
         self.machine.device_id()

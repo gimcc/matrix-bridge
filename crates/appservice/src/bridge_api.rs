@@ -324,11 +324,10 @@ async fn handle_send_message(
             })),
         ),
         Err(e) => {
-            error!(platform = req.platform, "bridge api send failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal error" })),
-            )
+            let status =
+                StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            error!(platform = req.platform, %status, "bridge api send failed: {e}");
+            (status, Json(json!({ "error": e.to_string() })))
         }
     }
 }

@@ -50,7 +50,8 @@ There is also a `crates/bridge-telegram` placeholder for a native Telegram platf
               | between Matrix |
               | and external   |
               | platforms.     |
-              | Cross-platform |
+              | Access control,|
+              | cross-platform |
               | forwarding +   |
               | loop prevention|
               +-------+--------+
@@ -132,10 +133,12 @@ Matrix Client          Synapse                  Bridge                  External
      |                    |         -> handle_event -> handle_room_message   |
      |                    |                       |                          |
      |                    |         1. Check: is sender bridge_bot? skip     |
-     |                    |         2. Check: is sender a puppet? extract    |
+     |                    |         2. Check: invite_whitelist (Layer 0)     |
+     |                    |            - puppets bypass, others must match   |
+     |                    |         3. Check: is sender a puppet? extract    |
      |                    |            source_platform for loop prevention   |
-     |                    |         3. DB: find_all_mappings_by_matrix_id    |
-     |                    |         4. For each mapping:                     |
+     |                    |         4. DB: find_all_mappings_by_matrix_id    |
+     |                    |         5. For each mapping:                     |
      |                    |            - skip if mapping.platform == source  |
      |                    |            - deliver_to_webhooks                 |
      |                    |                       |                          |
@@ -145,7 +148,7 @@ Matrix Client          Synapse                  Bridge                  External
      |                    |                       |   message: {...}}       |
      |                    |                       |------------------------->|
      |                    |                       |                          |
-     |                    |         5. DB: create_message_mapping            |
+     |                    |         6. DB: create_message_mapping            |
      |                    |                       |                          |
      |                    |  200 OK {}            |                          |
      |                    |<----------------------|                          |
@@ -225,9 +228,88 @@ Key implementation details:
 
 ---
 
-## Two-Layer Filtering
+## Access Control (Invite Whitelist)
 
-The bridge uses two complementary mechanisms to control which messages reach which webhooks.
+The bridge enforces a configurable whitelist that controls who can interact with the bridge bot and puppet users. This is implemented in `PermissionsConfig` (`crates/core/src/config.rs`) and enforced by the `Dispatcher`.
+
+### Configuration
+
+```toml
+[permissions]
+invite_whitelist = ["@*:example.com"]
+```
+
+### Pattern Syntax
+
+| Pattern | Matches |
+|---------|---------|
+| _(empty list)_ | Everyone (open mode, default) |
+| `"*"` | Everyone (explicit wildcard) |
+| `"@admin:example.com"` | Exact user only |
+| `"@*:example.com"` | Any user on that domain |
+
+Multiple patterns can be combined:
+
+```toml
+invite_whitelist = ["@admin:a.com", "@*:b.com"]
+# @admin:a.com  → allowed
+# @other:a.com  → blocked
+# @anyone:b.com → allowed
+```
+
+### Three Enforcement Points
+
+The whitelist is checked at three distinct points in the Dispatcher:
+
+```
+                        Invite Event                    Message Event
+                             |                               |
+                    ┌────────▼────────┐             ┌────────▼────────┐
+                    │ Is target the   │             │ Is sender a     │
+                    │ bot or puppet?  │             │ puppet user?    │
+                    └──┬──────────┬───┘             └──┬──────────┬───┘
+                    No │          │ Yes             Yes │          │ No
+                       │          ▼                     │          ▼
+                    Ignore   ┌────────────┐          Bypass  ┌────────────┐
+                             │ Is inviter │                  │ Is sender  │
+                             │ bridge_bot?│                  │ whitelisted│
+                             └──┬──────┬──┘                  └──┬──────┬──┘
+                             Yes│      │No                   Yes│      │No
+                                ▼      ▼                       ▼      ▼
+                             Accept  Check                  Forward  Block
+                                     whitelist
+```
+
+**Point 1: Bot invite** — When someone invites `@bridge_bot:domain` to a room, the sender must be in the whitelist.
+
+**Point 2: Puppet invite** — When someone invites a puppet user (e.g., `@bot_telegram_123:domain`), the sender must be in the whitelist. The bridge bot itself always bypasses this check (it invites puppets as part of normal operation).
+
+**Point 3: Message forwarding** — When a Matrix user sends a message in a bridged room, their message is only forwarded to external platform webhooks if the sender is in the whitelist. Puppet users bypass this check since they relay messages from authorized external platforms.
+
+### Why This Matters
+
+Without the whitelist, any Matrix user could:
+- Invite the bridge bot to arbitrary rooms and bridge them to external platforms
+- Invite puppet users directly, bypassing normal bridge flows
+- Send messages through bridged rooms to external platforms
+
+The whitelist ensures only authorized users (e.g., users on your own homeserver) can use the bridge.
+
+### Implementation
+
+- `PermissionsConfig::is_invite_allowed()` in `crates/core/src/config.rs` — pattern matching logic
+- `Dispatcher::handle_membership()` in `crates/appservice/src/dispatcher.rs` — invite enforcement
+- `Dispatcher::handle_room_message()` in `crates/appservice/src/dispatcher.rs` — forwarding enforcement
+
+---
+
+## Three-Layer Filtering
+
+The bridge uses three complementary mechanisms to control message flow. Layer 0 (access control) determines _who_ can use the bridge. Layers 1 and 2 determine _where_ messages are delivered.
+
+### Layer 0: Access Control (Invite Whitelist)
+
+See the [Access Control](#access-control-invite-whitelist) section above. This is the first check applied to both invites and message forwarding.
 
 ### Layer 1: Built-in Loop Prevention
 
@@ -270,10 +352,13 @@ for webhook in webhooks:
         POST to webhook.url
 ```
 
-### Filtering Matrix
+### Filtering Example
 
 ```
 Message from @telegram_user123:domain in a room bridged to Slack + Discord:
+
+Layer 0 (access control):
+  - @telegram_user123 is a puppet user → BYPASS whitelist check
 
 Layer 1 (loop prevention):
   - telegram mapping: SKIP (source == telegram)
@@ -285,6 +370,15 @@ Layer 2 (exclude_sources on each webhook):
   - Discord webhook (exclude_sources="telegram"): SKIP
 
 Result: message delivered to Slack only
+```
+
+```
+Message from @alice:example.com (non-whitelisted) in a bridged room:
+
+Layer 0 (access control):
+  - @alice:example.com is not in invite_whitelist → BLOCK
+
+Result: message not forwarded to any webhook
 ```
 
 ---
@@ -347,13 +441,15 @@ Puppet (ghost) users represent external platform users inside Matrix rooms.
 ### Naming Convention
 
 ```
-@{platform}_{external_user_id}:{server_name}
+@{prefix}_{platform}_{external_user_id}:{server_name}
 ```
 
+The prefix is configurable via `appservice.puppet_prefix` (default: `"bot"`).
+
 Examples:
-- `@telegram_user123:im.fr.ds.cc`
-- `@slack_U05ABC:im.fr.ds.cc`
-- `@discord_123456789:im.fr.ds.cc`
+- `@bot_telegram_user123:im.fr.ds.cc`
+- `@bot_slack_U05ABC:im.fr.ds.cc`
+- `@bot_discord_123456789:im.fr.ds.cc`
 
 The localpart must match `[a-z0-9._\-=/]+` per the Matrix spec.
 

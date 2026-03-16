@@ -33,6 +33,18 @@ pub enum BridgeError {
     Internal(String),
 }
 
+impl BridgeError {
+    /// Map error variant to an HTTP status code.
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::NotFound(_) => 404,
+            Self::Auth(_) => 401,
+            Self::Validation(_) | Self::Serialization(_) => 400,
+            _ => 500,
+        }
+    }
+}
+
 impl From<serde_json::Error> for BridgeError {
     fn from(e: serde_json::Error) -> Self {
         Self::Serialization(e.to_string())

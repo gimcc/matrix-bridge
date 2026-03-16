@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         &config.homeserver.domain,
         &config.appservice.sender_localpart,
         &config.appservice.puppet_prefix,
+        config.permissions.clone(),
     );
 
     // Wire up crypto manager to dispatcher for outbound encryption.

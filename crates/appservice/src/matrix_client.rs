@@ -230,7 +230,83 @@ impl MatrixClient {
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            warn!(room_id, as_user, "failed to join room: {text}");
+            anyhow::bail!("failed to join room {room_id} as {as_user}: {text}");
+        }
+        Ok(())
+    }
+
+    /// Create a new Matrix room as the bridge bot.
+    ///
+    /// Returns the room ID. The bridge bot is automatically a member (creator).
+    /// When `encrypted` is true, the room is created with m.room.encryption.
+    pub async fn create_room(
+        &self,
+        name: Option<&str>,
+        invite: &[&str],
+        encrypted: bool,
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/_matrix/client/v3/createRoom", self.homeserver_url);
+
+        let mut initial_state: Vec<Value> = Vec::new();
+        if encrypted {
+            initial_state.push(json!({
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": { "algorithm": "m.megolm.v1.aes-sha2" },
+            }));
+        }
+
+        let mut body = json!({
+            "preset": "private_chat",
+            "initial_state": initial_state,
+            "invite": invite,
+        });
+        if let Some(n) = name {
+            body["name"] = n.into();
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let data: Value = resp.json().await?;
+            let room_id = data
+                .get("room_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            debug!(room_id, "room created");
+            Ok(room_id)
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("create room failed: {text}");
+        }
+    }
+
+    /// Invite a user to a room (as the bridge bot).
+    pub async fn invite_user(&self, room_id: &str, user_id: &str) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/invite",
+            self.homeserver_url,
+            urlencoding::encode(room_id)
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .json(&json!({ "user_id": user_id }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("failed to invite {user_id} to {room_id}: {text}");
         }
         Ok(())
     }

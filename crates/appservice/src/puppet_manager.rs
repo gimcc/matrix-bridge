@@ -64,19 +64,15 @@ impl PuppetManager {
             let name_changed = user.display_name.as_deref() != puppet.display_name.as_deref();
             let avatar_changed = user.avatar_url.as_deref() != puppet.avatar_mxc.as_deref();
 
-            if name_changed {
-                if let Some(name) = &user.display_name {
-                    self.matrix_client
-                        .set_display_name(&puppet.matrix_user_id, name)
-                        .await?;
-                }
+            if name_changed && let Some(name) = &user.display_name {
+                self.matrix_client
+                    .set_display_name(&puppet.matrix_user_id, name)
+                    .await?;
             }
-            if avatar_changed {
-                if let Some(url) = &user.avatar_url {
-                    self.matrix_client
-                        .set_avatar(&puppet.matrix_user_id, url)
-                        .await?;
-                }
+            if avatar_changed && let Some(url) = &user.avatar_url {
+                self.matrix_client
+                    .set_avatar(&puppet.matrix_user_id, url)
+                    .await?;
             }
             if name_changed || avatar_changed {
                 self.db
@@ -150,19 +146,15 @@ impl PuppetManager {
             let name_changed = display_name != puppet.display_name.as_deref();
             let avatar_changed = avatar_url != puppet.avatar_mxc.as_deref();
 
-            if name_changed {
-                if let Some(name) = display_name {
-                    self.matrix_client
-                        .set_display_name(&puppet.matrix_user_id, name)
-                        .await?;
-                }
+            if name_changed && let Some(name) = display_name {
+                self.matrix_client
+                    .set_display_name(&puppet.matrix_user_id, name)
+                    .await?;
             }
-            if avatar_changed {
-                if let Some(url) = avatar_url {
-                    self.matrix_client
-                        .set_avatar(&puppet.matrix_user_id, url)
-                        .await?;
-                }
+            if avatar_changed && let Some(url) = avatar_url {
+                self.matrix_client
+                    .set_avatar(&puppet.matrix_user_id, url)
+                    .await?;
             }
             if name_changed || avatar_changed {
                 self.db

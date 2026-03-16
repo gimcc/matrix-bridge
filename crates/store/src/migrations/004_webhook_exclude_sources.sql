@@ -1,4 +1,3 @@
--- Add exclude_sources column to webhooks.
--- Comma-separated list of platform IDs whose messages should NOT be
--- forwarded to this webhook. Empty string means no exclusions.
-ALTER TABLE webhooks ADD COLUMN exclude_sources TEXT NOT NULL DEFAULT '';
+-- This migration is applied programmatically in db.rs
+-- to handle the case where the column already exists.
+-- See Database::migrate() for the ALTER TABLE logic.

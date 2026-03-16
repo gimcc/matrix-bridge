@@ -89,6 +89,20 @@ crypto_store_passphrase = "CHANGE_ME_CRYPTO_PASSPHRASE"
 
 # Bridge 加密设备的显示名称。
 device_display_name = "Matrix Bridge"
+
+# ─── 访问控制 ───────────────────────────────────────────────
+[permissions]
+# 允许使用桥接器的 Matrix 用户白名单。
+# 控制谁可以邀请 bot/傀儡用户，以及谁的消息
+# 会被转发到外部平台。
+#
+# 支持的匹配模式：
+#   "@admin:example.com"  — 精确匹配用户
+#   "@*:example.com"      — 匹配该域名下所有用户
+#   "*"                   — 所有人（等同于空列表）
+#
+# 空列表（默认）= 开放模式，允许所有人。
+invite_whitelist = ["@*:example.com"]
 ```
 
 > **安全提示：** 运行前务必替换所有 `CHANGE_ME_*` 占位符。可使用 `openssl rand -hex 32` 等工具生成令牌和口令。
@@ -108,7 +122,7 @@ sender_localpart: bridge_bot
 namespaces:
   users:
     - exclusive: true
-      regex: "@[a-z]+_.*:.*"      # 傀儡用户命名空间
+      regex: "@bot_.*:.*"          # 傀儡用户命名空间
     - exclusive: true
       regex: "@bridge_bot:.*"     # Bridge 机器人本身
 rate_limited: false

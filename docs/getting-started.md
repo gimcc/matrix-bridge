@@ -90,6 +90,20 @@ crypto_store_passphrase = "CHANGE_ME_CRYPTO_PASSPHRASE"
 
 # The display name shown for the bridge's encryption device.
 device_display_name = "Matrix Bridge"
+
+# ─── Access Control ──────────────────────────────────────────
+[permissions]
+# Whitelist of Matrix user IDs allowed to use the bridge.
+# Controls who can invite the bot/puppets and whose messages
+# are forwarded to external platforms.
+#
+# Supported patterns:
+#   "@admin:example.com"  — exact user match
+#   "@*:example.com"      — all users on the domain
+#   "*"                   — everyone (same as empty list)
+#
+# Empty list (default) = open mode, everyone is allowed.
+invite_whitelist = ["@*:example.com"]
 ```
 
 > **Security note:** Replace every `CHANGE_ME_*` value before running the bridge. Use `openssl rand -hex 32` or a similar tool to generate tokens and passphrases.
@@ -109,7 +123,7 @@ sender_localpart: bridge_bot
 namespaces:
   users:
     - exclusive: true
-      regex: "@[a-z]+_.*:.*"      # Puppet user namespace
+      regex: "@bot_.*:.*"          # Puppet user namespace
     - exclusive: true
       regex: "@bridge_bot:.*"     # The bridge bot itself
 rate_limited: false

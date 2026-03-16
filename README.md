@@ -20,9 +20,10 @@ A generic, bidirectional Matrix bridge. Any service with HTTP can bridge to Matr
 
 - **Platform-agnostic HTTP API** — bridge any service without plugins
 - **Bidirectional** — inbound via REST, outbound via webhooks
-- **Puppet users** — external users appear as `@{platform}_{id}:domain`
+- **Puppet users** — external users appear as `@{prefix}_{platform}_{id}:domain`
 - **Multi-platform rooms** — one Matrix room bridges to Telegram + Slack + ...
 - **Cross-platform forwarding** — Telegram message auto-forwards to Slack (with original sender info)
+- **Access control** — invite whitelist for bot/puppet users + message forwarding restrictions
 - **E2BE encryption** — optional end-to-bridge encryption (mautrix approach)
 - **Rich content** — text, images, files, video, audio, reactions, edits, redactions
 
