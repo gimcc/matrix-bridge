@@ -1,0 +1,13 @@
+[package]
+name = "matrix-bridge-telegram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+matrix-bridge-core = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
