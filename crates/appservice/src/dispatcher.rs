@@ -647,47 +647,35 @@ impl Dispatcher {
 
     /// Ensure a puppet user can access a Matrix room.
     ///
-    /// Flow:
-    /// 1. Try puppet join directly (works if room is public or puppet was already invited).
-    /// 2. If that fails, ensure the bridge bot is in the room first.
-    /// 3. Bridge bot invites the puppet.
-    /// 4. Puppet retries join after invite.
+    /// Always goes through the bridge bot invite flow to prevent accepting
+    /// pending invites from non-whitelisted users:
+    /// 1. Ensure the bridge bot is in the room.
+    /// 2. Bridge bot invites the puppet.
+    /// 3. Puppet joins after invite.
+    ///
+    /// If the puppet is already a member, the invite and join are harmless no-ops.
     async fn ensure_room_access(
         &self,
         room_id: &str,
         puppet_user_id: &str,
     ) -> Result<(), BridgeError> {
-        // Try direct join first.
-        if self
-            .matrix_client
-            .join_room(room_id, puppet_user_id)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-
-        // Direct join failed — ensure bridge bot is in the room.
-        debug!(
-            room_id,
-            puppet_user_id, "direct puppet join failed, ensuring bridge bot access"
-        );
+        // Ensure bridge bot is in the room first.
         self.matrix_client
             .join_room(room_id, &self.bot_user_id)
             .await
             .map_err(|e| BridgeError::Matrix(format!("bridge bot join failed: {e}")))?;
 
-        // Bridge bot invites puppet.
+        // Bridge bot invites puppet (no-op if already a member).
         self.matrix_client
             .invite_user(room_id, puppet_user_id)
             .await
             .map_err(|e| BridgeError::Matrix(format!("invite puppet failed: {e}")))?;
 
-        // Puppet retries join after invite.
+        // Puppet joins after invite.
         self.matrix_client
             .join_room(room_id, puppet_user_id)
             .await
-            .map_err(|e| BridgeError::Matrix(format!("puppet join after invite failed: {e}")))?;
+            .map_err(|e| BridgeError::Matrix(format!("puppet join failed: {e}")))?;
 
         Ok(())
     }

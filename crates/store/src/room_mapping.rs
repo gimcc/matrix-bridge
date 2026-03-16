@@ -48,12 +48,9 @@ impl Database {
             // Both constraints match the same row — no-op.
             (Some(id_m), Some(id_e)) if id_m == id_e => Ok(id_m),
 
-            // Both match but different rows — merge: update one, migrate message_mappings, delete the other.
+            // Both match but different rows — merge: migrate message_mappings,
+            // delete the conflicting row, then update the surviving one.
             (Some(id_m), Some(id_e)) => {
-                conn.execute(
-                    "UPDATE room_mappings SET external_room_id = ?1 WHERE id = ?2",
-                    rusqlite::params![external_room_id, id_m],
-                )?;
                 conn.execute(
                     "UPDATE message_mappings SET room_mapping_id = ?1 WHERE room_mapping_id = ?2",
                     rusqlite::params![id_m, id_e],
@@ -61,6 +58,10 @@ impl Database {
                 conn.execute(
                     "DELETE FROM room_mappings WHERE id = ?1",
                     rusqlite::params![id_e],
+                )?;
+                conn.execute(
+                    "UPDATE room_mappings SET external_room_id = ?1 WHERE id = ?2",
+                    rusqlite::params![external_room_id, id_m],
                 )?;
                 Ok(id_m)
             }
