@@ -226,10 +226,7 @@ mod tests {
     #[test]
     fn test_multiple_patterns() {
         let p = PermissionsConfig {
-            invite_whitelist: vec![
-                "@admin:a.com".to_string(),
-                "@*:b.com".to_string(),
-            ],
+            invite_whitelist: vec!["@admin:a.com".to_string(), "@*:b.com".to_string()],
         };
         assert!(p.is_invite_allowed("@admin:a.com"));
         assert!(!p.is_invite_allowed("@user:a.com"));
@@ -254,10 +251,7 @@ mod tests {
     fn test_mixed_user_and_domain() {
         // User-level on domain A + domain-wide on domain B.
         let p = PermissionsConfig {
-            invite_whitelist: vec![
-                "@b:aa.im".to_string(),
-                "@*:bb.im".to_string(),
-            ],
+            invite_whitelist: vec!["@b:aa.im".to_string(), "@*:bb.im".to_string()],
         };
         assert!(p.is_invite_allowed("@b:aa.im"));
         assert!(!p.is_invite_allowed("@a:aa.im"));

@@ -173,19 +173,14 @@ impl Dispatcher {
 
         // Check invite whitelist for both bot and puppet invites.
         // The bridge bot itself is always allowed (it invites puppets internally).
-        let inviter = event
-            .get("sender")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let inviter = event.get("sender").and_then(|v| v.as_str()).unwrap_or("");
 
         let is_bridge_bot_inviting = inviter == self.bot_user_id;
         if !is_bridge_bot_inviting && !self.permissions.is_invite_allowed(inviter) {
             let target = if is_bot { "bot" } else { "puppet" };
             warn!(
                 room_id,
-                inviter,
-                target,
-                "invite rejected: sender not in invite_whitelist"
+                inviter, target, "invite rejected: sender not in invite_whitelist"
             );
             return Ok(());
         }
@@ -241,7 +236,10 @@ impl Dispatcher {
 
         // Ensure we have tracked all room members' devices before decrypting.
         if let Err(e) = self.update_tracked_users(room_id, crypto).await {
-            warn!(room_id, "failed to update tracked users before decrypt: {e}");
+            warn!(
+                room_id,
+                "failed to update tracked users before decrypt: {e}"
+            );
         }
 
         let event_id = event.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -249,8 +247,8 @@ impl Dispatcher {
             Ok(d) => d,
             Err(e) => {
                 error!(
-                    room_id, sender, event_id,
-                    "failed to decrypt event (message will be dropped): {e}"
+                    room_id,
+                    sender, event_id, "failed to decrypt event (message will be dropped): {e}"
                 );
                 return Ok(());
             }
@@ -311,8 +309,7 @@ impl Dispatcher {
         if !is_puppet_sender && !self.permissions.is_invite_allowed(sender) {
             debug!(
                 sender,
-                room_id,
-                "message forwarding blocked: sender not in invite_whitelist"
+                room_id, "message forwarding blocked: sender not in invite_whitelist"
             );
             return Ok(());
         }
@@ -674,7 +671,10 @@ impl Dispatcher {
         }
 
         // Direct join failed — ensure bridge bot is in the room.
-        debug!(room_id, puppet_user_id, "direct puppet join failed, ensuring bridge bot access");
+        debug!(
+            room_id,
+            puppet_user_id, "direct puppet join failed, ensuring bridge bot access"
+        );
         self.matrix_client
             .join_room(room_id, &self.bot_user_id)
             .await
@@ -1032,18 +1032,17 @@ impl Dispatcher {
 
                 let matrix_room_id = self
                     .matrix_client
-                    .create_room(
-                        Some(room_name),
-                        &[],
-                        self.encryption_default,
-                    )
+                    .create_room(Some(room_name), &[], self.encryption_default)
                     .await
-                    .map_err(|e| BridgeError::Matrix(format!("portal room creation failed: {e}")))?;
+                    .map_err(|e| {
+                        BridgeError::Matrix(format!("portal room creation failed: {e}"))
+                    })?;
 
                 // If encryption was enabled, track it in the crypto store.
                 if self.encryption_default {
                     if let Some(crypto) = &self.crypto {
-                        if let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(matrix_room_id.as_str()) {
+                        if let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(matrix_room_id.as_str())
+                        {
                             let _ = crypto.set_room_encrypted(ruma_room_id).await;
                         }
                     }

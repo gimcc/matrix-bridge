@@ -30,12 +30,18 @@ impl Database {
         // Check for an existing mapping on either unique constraint.
         let existing_by_matrix: Option<i64> = conn
             .prepare("SELECT id FROM room_mappings WHERE matrix_room_id = ?1 AND platform_id = ?2")?
-            .query_row(rusqlite::params![matrix_room_id, platform_id], |row| row.get(0))
+            .query_row(rusqlite::params![matrix_room_id, platform_id], |row| {
+                row.get(0)
+            })
             .ok();
 
         let existing_by_external: Option<i64> = conn
-            .prepare("SELECT id FROM room_mappings WHERE platform_id = ?1 AND external_room_id = ?2")?
-            .query_row(rusqlite::params![platform_id, external_room_id], |row| row.get(0))
+            .prepare(
+                "SELECT id FROM room_mappings WHERE platform_id = ?1 AND external_room_id = ?2",
+            )?
+            .query_row(rusqlite::params![platform_id, external_room_id], |row| {
+                row.get(0)
+            })
             .ok();
 
         match (existing_by_matrix, existing_by_external) {

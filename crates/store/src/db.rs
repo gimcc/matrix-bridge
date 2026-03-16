@@ -49,7 +49,9 @@ impl Database {
         // SQLite has no "ALTER TABLE ... ADD COLUMN IF NOT EXISTS",
         // so we check the table schema first.
         let has_column: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('webhooks') WHERE name = 'exclude_sources'")?
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('webhooks') WHERE name = 'exclude_sources'",
+            )?
             .query_row([], |row| row.get::<_, i64>(0))
             .map(|count| count > 0)?;
         if !has_column {
