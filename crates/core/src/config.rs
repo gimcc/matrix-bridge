@@ -134,7 +134,7 @@ fn default_log_level() -> String {
 }
 
 /// Access control configuration.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct PermissionsConfig {
     /// Whitelist of Matrix user IDs allowed to invite the bridge bot.
     /// Empty list = allow everyone (open mode, default).
@@ -148,14 +148,6 @@ pub struct PermissionsConfig {
     /// since they are managed by the bridge itself.
     #[serde(default)]
     pub invite_whitelist: Vec<String>,
-}
-
-impl Default for PermissionsConfig {
-    fn default() -> Self {
-        Self {
-            invite_whitelist: Vec::new(),
-        }
-    }
 }
 
 impl PermissionsConfig {
@@ -173,10 +165,11 @@ impl PermissionsConfig {
                 return true;
             }
             // Domain wildcard: "@*:example.com" matches any "@xxx:example.com"
-            if let Some(domain_suffix) = pattern.strip_prefix("@*") {
-                if sender.starts_with('@') && sender.ends_with(domain_suffix) {
-                    return true;
-                }
+            if let Some(domain_suffix) = pattern.strip_prefix("@*")
+                && sender.starts_with('@')
+                && sender.ends_with(domain_suffix)
+            {
+                return true;
             }
         }
         false

@@ -203,16 +203,13 @@ impl Dispatcher {
         }
 
         // If the bridge bot just joined an encrypted room, track device keys.
-        if is_bot {
-            if let Some(crypto) = crypto {
-                let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
-                if let Ok(ruma_room_id) = ruma_room_id {
-                    if crypto.is_room_encrypted(ruma_room_id).await {
-                        if let Err(e) = self.update_tracked_users(room_id, crypto).await {
-                            warn!(room_id, "failed to track users after bot join: {e}");
-                        }
-                    }
-                }
+        if is_bot && let Some(crypto) = crypto {
+            let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
+            if let Ok(ruma_room_id) = ruma_room_id
+                && crypto.is_room_encrypted(ruma_room_id).await
+                && let Err(e) = self.update_tracked_users(room_id, crypto).await
+            {
+                warn!(room_id, "failed to track users after bot join: {e}");
             }
         }
 
@@ -436,14 +433,14 @@ impl Dispatcher {
 
         for mapping in &mappings {
             // Skip forwarding back to the puppet's source platform (loop prevention).
-            if let Some(ref src) = source_platform {
-                if mapping.platform_id == *src {
-                    debug!(
-                        platform = mapping.platform_id,
-                        sender, "skipping source platform to prevent loop"
-                    );
-                    continue;
-                }
+            if let Some(ref src) = source_platform
+                && mapping.platform_id == *src
+            {
+                debug!(
+                    platform = mapping.platform_id,
+                    sender, "skipping source platform to prevent loop"
+                );
+                continue;
             }
 
             let bridge_sender = if let Some(ref puppet) = original_sender {
@@ -544,16 +541,16 @@ impl Dispatcher {
 
         for webhook in &webhooks {
             // Check per-webhook source exclusion filter.
-            if let Some(src) = source_platform {
-                if webhook.is_source_excluded(src) {
-                    debug!(
-                        platform = platform_id,
-                        url = webhook.webhook_url,
-                        source = src,
-                        "webhook excluded this source platform"
-                    );
-                    continue;
-                }
+            if let Some(src) = source_platform
+                && webhook.is_source_excluded(src)
+            {
+                debug!(
+                    platform = platform_id,
+                    url = webhook.webhook_url,
+                    source = src,
+                    "webhook excluded this source platform"
+                );
+                continue;
             }
             match client
                 .post(&webhook.webhook_url)
@@ -939,18 +936,18 @@ impl Dispatcher {
                 }
 
                 // Auto-enable encryption if configured.
-                if self.encryption_default {
-                    if let Err(e) = self.enable_room_encryption(room_id).await {
-                        warn!(room_id, "failed to auto-enable encryption: {e}");
-                    }
+                if self.encryption_default
+                    && let Err(e) = self.enable_room_encryption(room_id).await
+                {
+                    warn!(room_id, "failed to auto-enable encryption: {e}");
                 }
 
                 // If E2EE is active, query device keys of room members so they
                 // can share Megolm sessions with the bridge bot.
-                if let Some(crypto) = &self.crypto {
-                    if let Err(e) = self.update_tracked_users(room_id, crypto).await {
-                        warn!(room_id, "failed to update tracked users: {e}");
-                    }
+                if let Some(crypto) = &self.crypto
+                    && let Err(e) = self.update_tracked_users(room_id, crypto).await
+                {
+                    warn!(room_id, "failed to update tracked users: {e}");
                 }
 
                 info!(room_id, platform_id, external_id, "room linked");
@@ -1039,13 +1036,11 @@ impl Dispatcher {
                     })?;
 
                 // If encryption was enabled, track it in the crypto store.
-                if self.encryption_default {
-                    if let Some(crypto) = &self.crypto {
-                        if let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(matrix_room_id.as_str())
-                        {
-                            let _ = crypto.set_room_encrypted(ruma_room_id).await;
-                        }
-                    }
+                if self.encryption_default
+                    && let Some(crypto) = &self.crypto
+                    && let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(matrix_room_id.as_str())
+                {
+                    let _ = crypto.set_room_encrypted(ruma_room_id).await;
                 }
 
                 // Register the room mapping.
