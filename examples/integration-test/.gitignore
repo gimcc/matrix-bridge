@@ -1,0 +1,5 @@
+node_modules/
+dist/
+crypto-store/
+bot-storage.json
+*.log

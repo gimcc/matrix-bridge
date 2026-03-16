@@ -1,0 +1,37 @@
+# Local development build — compiles from source inside Docker.
+# Usage:
+#   docker build -f Dockerfile.local -t matrix-bridge .
+#   docker compose -f ../docker-compose.yml up bridge
+
+FROM rust:1.88-bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY src src
+
+# Build with release optimizations; use cargo cache mount to speed up rebuilds.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release && cp target/release/matrix-bridge /matrix-bridge
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 1000 bridge && useradd -u 1000 -g bridge -d /data -s /sbin/nologin bridge
+
+COPY --from=builder /matrix-bridge /usr/local/bin/matrix-bridge
+
+RUN mkdir -p /data && chown bridge:bridge /data
+
+ENV BRIDGE_CONFIG=/data/config.toml
+ENV BRIDGE_REGISTRATION=/data/registration.yaml
+
+EXPOSE 29320
+
+USER bridge
+WORKDIR /data
+
+ENTRYPOINT ["matrix-bridge"]

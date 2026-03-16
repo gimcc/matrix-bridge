@@ -1,0 +1,97 @@
+[homeserver]
+url = "http://matrix:8008"
+domain = "im.fr.ds.cc"
+
+[appservice]
+id = "unified-bridge"
+address = "0.0.0.0"
+port = 29320
+sender_localpart = "bridge_bot"
+# Generate secure tokens before deployment:
+#   head -c 32 /dev/urandom | base64
+as_token = "CHANGE_ME_AS_TOKEN"
+hs_token = "CHANGE_ME_HS_TOKEN"
+# Optional API key for the Bridge HTTP API (/api/v1/*).
+# When set, external services must include this key via:
+#   Authorization: Bearer <api_key>   OR   ?access_token=<api_key>
+# When omitted (default), the Bridge API requires no authentication —
+# suitable for internal/trusted-network deployments.
+# This is separate from hs_token (which is a Matrix protocol secret).
+# Generate: head -c 32 /dev/urandom | base64
+# api_key = "YOUR_BRIDGE_API_KEY"
+# Block webhook URLs targeting private/reserved IP ranges (SSRF protection).
+# Default: false (allow private IPs — internal deployments where webhook
+# targets are on the same private network).
+# Set to true when the bridge is exposed to untrusted networks.
+# webhook_ssrf_protection = true
+# Matrix users to auto-invite into rooms created by the bridge.
+# Without this, auto-created rooms are empty (only the bridge bot).
+# auto_invite = ["@admin:im.fr.ds.cc"]
+# Allow the Bridge API `invite` field in room creation requests.
+# When false (default), the `invite` field is silently ignored —
+# only `auto_invite` from config is used. This prevents external
+# services from inviting arbitrary Matrix users.
+# allow_api_invite = false
+# Allow cross-platform relay: forward messages from one external platform
+# (e.g. telegram) to another (e.g. discord) via webhooks/WebSocket.
+# When false (default), only messages from real Matrix users are forwarded.
+# When true, per-webhook `forward_sources` allowlists control which
+# cross-platform messages are relayed.
+# allow_relay = false
+
+[database]
+path = "/data/bridge.db"
+
+[logging]
+level = "info"
+
+# End-to-bridge encryption (E2BE).
+# When enabled, messages between Matrix clients and the bridge are encrypted.
+# The bridge bot acts as a single crypto device using the mautrix approach:
+# - MSC2409: to-device events via appservice transactions (no /sync needed)
+# - MSC3202: device list changes and OTK counts via transactions
+# - MSC4190: device management for appservices
+[encryption]
+allow = true
+default = true        # Automatically enable encryption for new portal rooms
+appservice = true     # Use appservice mode (recommended, no /sync polling)
+crypto_store = "/data/crypto"
+crypto_store_passphrase = "CHANGE_ME_CRYPTO_PASSPHRASE"
+device_display_name = "Matrix Bridge"
+
+# Platform-specific configuration sections (reserved for future built-in bridges).
+# Currently all platforms use the HTTP Bridge API below.
+# [platforms]
+
+# --- HTTP Bridge API -----------------------------------------------
+# External services can bridge with Matrix via HTTP without being
+# compiled into this binary.
+#
+# 1. Create room mapping:
+#    POST /api/v1/rooms
+#    {"platform":"myapp","external_room_id":"chat_123"}
+#    Optional fields:
+#      "matrix_room_id": "!abc:im.fr.ds.cc"  (auto-creates room if omitted)
+#      "room_name": "My Chat Room"            (name for auto-created rooms)
+#      "invite": ["@alice:im.fr.ds.cc"]       (requires allow_api_invite = true)
+#
+# 2. Register webhook (receive Matrix -> external messages):
+#    POST /api/v1/webhooks
+#    {"platform":"myapp","url":"https://myapp.example.com/webhook"}
+#    Optional: "forward_sources": ["*"]  (also forward messages from other platforms)
+#    Messages from Matrix users are always forwarded (bridge core functionality).
+#    forward_sources controls forwarding of messages originating from *other*
+#    external platforms bridged into the same room:
+#      omitted/[]   = only forward Matrix user messages (default)
+#      ["*"]        = forward all sources (Matrix + other platforms)
+#      ["telegram"] = forward Matrix + telegram only
+#
+# 3. Send message (external -> Matrix):
+#    POST /api/v1/message
+#    {"platform":"myapp","room_id":"chat_123",
+#     "sender":{"id":"user_1","display_name":"Alice"},
+#     "content":{"type":"text","body":"Hello from my app!"}}
+#
+# 4. Your webhook receives Matrix messages:
+#    POST https://myapp.example.com/webhook
+#    {"event":"message","platform":"myapp","message":{...}}
