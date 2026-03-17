@@ -1,8 +1,9 @@
 name: Docker
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 env:
   REGISTRY: ghcr.io
@@ -11,6 +12,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     permissions:
       contents: read
@@ -19,6 +21,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          gh release download "$TAG" \
+            --pattern "matrix-bridge-linux-amd64" \
+            --pattern "matrix-bridge-linux-arm64" \
+            --dir .
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -40,8 +54,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=v(.*),group=1,value=${{ github.event.workflow_run.head_branch }}
+            type=match,pattern=v(\d+\.\d+),group=1,value=${{ github.event.workflow_run.head_branch }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -51,5 +65,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
