@@ -5,7 +5,7 @@ Bridge via HTTP webhooks.
 
 ## What these demos do
 
-Each demo (Python and Node.js) is a standalone HTTP server that:
+Each demo (Python, Node.js, and Bun) is a standalone HTTP server that:
 
 1. **Receives webhook callbacks** from the bridge when messages appear in a
    bridged Matrix room (outbound: Matrix -> External).
@@ -63,6 +63,19 @@ npm run start:test
 ```
 
 Requires Node.js 18+.
+
+## Running the Bun chat demo
+
+```bash
+cd examples/bun-chat
+
+export MATRIX_ROOM_ID='!your_room:example.com'
+
+bun run server.ts
+```
+
+Opens a web chat UI at `http://localhost:3030` that bridges to Matrix in
+real time via SSE. Requires Bun 1.1+.
 
 ---
 

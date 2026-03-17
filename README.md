@@ -77,7 +77,7 @@ curl -X POST http://bridge:29320/api/v1/message \
 | [Getting Started](docs/getting-started.md) | Configuration, deployment, Docker setup |
 | [API Reference](docs/api-reference.md) | Complete HTTP API specification |
 | [Architecture](docs/architecture.md) | System design, cross-platform forwarding, encryption |
-| [Examples](examples/) | Python and Node.js webhook integration demos |
+| [Examples](examples/) | Python, Node.js, and Bun chat integration demos |
 
 ### Chinese / 中文文档
 
@@ -86,7 +86,7 @@ curl -X POST http://bridge:29320/api/v1/message \
 | [快速入门](docs/getting-started.zh.md) | 配置、部署、Docker 设置 |
 | [API 参考](docs/api-reference.zh.md) | 完整 HTTP API 规范 |
 | [架构说明](docs/architecture.zh.md) | 系统设计、跨平台转发、加密 |
-| [示例代码](examples/) | Python 和 Node.js webhook 集成 demo |
+| [示例代码](examples/) | Python、Node.js 和 Bun 聊天集成 demo |
 
 ## Project Structure
 
