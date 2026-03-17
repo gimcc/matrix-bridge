@@ -16,12 +16,8 @@ use matrix_bridge_store::Database;
 
 /// Generate a URL-safe random token (32 bytes, base64).
 fn generate_token() -> String {
-    use std::io::Read;
     let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .expect("failed to open /dev/urandom")
-        .read_exact(&mut buf)
-        .expect("failed to read /dev/urandom");
+    getrandom::getrandom(&mut buf).expect("failed to generate random bytes");
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
@@ -94,6 +90,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    // Validate auto_invite entries.
+    for user_id in &config.appservice.auto_invite {
+        if !user_id.starts_with('@') || !user_id.contains(':') {
+            anyhow::bail!(
+                "invalid auto_invite entry '{}': must be a valid Matrix user ID (start with '@' and contain ':')",
+                user_id
+            );
+        }
+    }
+
     info!("starting matrix-bridge");
 
     // Open database.
@@ -137,22 +143,34 @@ async fn main() -> anyhow::Result<()> {
         let reg_as = reg_yaml.get("as_token").and_then(serde_yaml::Value::as_str);
         let reg_hs = reg_yaml.get("hs_token").and_then(serde_yaml::Value::as_str);
 
-        // Token mismatch is a fatal error — user must resolve manually.
-        if let Some(reg_as) = reg_as {
-            if reg_as != config.appservice.as_token {
+        // Token mismatch or absence is a fatal error — user must resolve manually.
+        match reg_as {
+            Some(val) if val != config.appservice.as_token => {
                 anyhow::bail!(
                     "as_token mismatch: config.toml and {reg_path} have different as_token values. \
                      Update one to match the other, or delete {reg_path} to regenerate."
                 );
             }
+            None => {
+                anyhow::bail!(
+                    "as_token missing in {reg_path}. Delete {reg_path} to regenerate."
+                );
+            }
+            _ => {}
         }
-        if let Some(reg_hs) = reg_hs {
-            if reg_hs != config.appservice.hs_token {
+        match reg_hs {
+            Some(val) if val != config.appservice.hs_token => {
                 anyhow::bail!(
                     "hs_token mismatch: config.toml and {reg_path} have different hs_token values. \
                      Update one to match the other, or delete {reg_path} to regenerate."
                 );
             }
+            None => {
+                anyhow::bail!(
+                    "hs_token missing in {reg_path}. Delete {reg_path} to regenerate."
+                );
+            }
+            _ => {}
         }
 
         // Detect encryption config drift: if config enables encryption but

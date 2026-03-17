@@ -8,11 +8,12 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::{error, info};
 
 use matrix_bridge_core::message::{BridgeMessage, ExternalRoom, ExternalUser, MessageContent};
 
+use crate::dispatcher::Dispatcher;
 use crate::server::AppState;
 
 /// Request body for sending a message from an external platform to Matrix.
@@ -433,6 +434,56 @@ async fn handle_send_message(
     }
 }
 
+/// Create a new Matrix room with the given name, invite list, and encryption
+/// settings.  Returns the new room's Matrix ID on success.
+async fn auto_create_room(
+    state: &AppState,
+    dispatcher: &Dispatcher,
+    room_name: &str,
+    invite: &[String],
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let invite_refs: Vec<&str> = invite.iter().map(|s| s.as_str()).collect();
+
+    let id = dispatcher
+        .matrix_client()
+        .create_room(Some(room_name), &invite_refs, state.encryption_default)
+        .await
+        .map_err(|e| {
+            error!("auto-create room failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "failed to create room" })),
+            )
+        })?;
+
+    // Register encryption state and track member devices so
+    // other clients share Megolm session keys with the bridge.
+    if state.encryption_default {
+        if let Some(crypto) = &state.crypto_manager {
+            if let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(id.as_str()) {
+                if let Err(e) = crypto.set_room_encrypted(ruma_room_id).await {
+                    error!(room_id = %id, "failed to mark room as encrypted: {e}");
+                }
+                // Query device keys for invited members.
+                let members: Vec<ruma::OwnedUserId> =
+                    invite.iter().filter_map(|u| u.parse().ok()).collect();
+                if !members.is_empty() {
+                    if let Err(e) = crypto.update_tracked_users(&members).await {
+                        error!(room_id = %id, "failed to track user devices: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    info!(
+        room_id = %id,
+        invited = ?invite,
+        "auto-created Matrix room for mapping"
+    );
+    Ok(id)
+}
+
 /// POST /api/v1/rooms
 ///
 /// Idempotent: if a mapping for `(platform, external_room_id)` already exists,
@@ -443,6 +494,40 @@ async fn handle_create_room_mapping(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRoomMappingRequest>,
 ) -> impl IntoResponse {
+    // Validate room_name length.
+    if let Some(ref name) = req.room_name {
+        if name.len() > 255 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "room_name exceeds 255 characters" })),
+            );
+        }
+    }
+
+    // Validate invite entries when allow_api_invite is enabled.
+    if state.allow_api_invite {
+        if req.invite.len() > 50 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invite list exceeds maximum of 50 entries" })),
+            );
+        }
+        for user_id in &req.invite {
+            if user_id.len() > 255 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("invite user ID too long: {}", user_id) })),
+                );
+            }
+            if !user_id.starts_with('@') || !user_id.contains(':') {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("invalid Matrix user ID: {}", user_id) })),
+                );
+            }
+        }
+    }
+
     let dispatcher = state.dispatcher.lock().await;
 
     // Check for an existing mapping first.
@@ -517,52 +602,11 @@ async fn handle_create_room_mapping(
                     }
                 }
             }
-            let invite_refs: Vec<&str> = invite_users.iter().map(|s| s.as_str()).collect();
 
             let room_name = req.room_name.as_deref().unwrap_or(&req.external_room_id);
-            match dispatcher
-                .matrix_client()
-                .create_room(Some(room_name), &invite_refs, state.encryption_default)
-                .await
-            {
-                Ok(id) => {
-                    // Register encryption state and track member devices so
-                    // other clients share Megolm session keys with the bridge.
-                    if state.encryption_default {
-                        if let Some(crypto) = &state.crypto_manager {
-                            if let Ok(ruma_room_id) =
-                                <&ruma::RoomId>::try_from(id.as_str())
-                            {
-                                if let Err(e) = crypto.set_room_encrypted(ruma_room_id).await {
-                                    error!(room_id = %id, "failed to mark room as encrypted: {e}");
-                                }
-                                // Query device keys for invited members.
-                                let members: Vec<ruma::OwnedUserId> = invite_users
-                                    .iter()
-                                    .filter_map(|u| u.parse().ok())
-                                    .collect();
-                                if !members.is_empty() {
-                                    if let Err(e) = crypto.update_tracked_users(&members).await {
-                                        error!(room_id = %id, "failed to track user devices: {e}");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    info!(
-                        room_id = %id,
-                        invited = ?invite_users,
-                        "auto-created Matrix room for mapping"
-                    );
-                    id
-                }
-                Err(e) => {
-                    error!("auto-create room failed: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": "failed to create room" })),
-                    );
-                }
+            match auto_create_room(&state, &dispatcher, room_name, &invite_users).await {
+                Ok(id) => id,
+                Err(resp) => return resp,
             }
         }
     };
@@ -588,13 +632,13 @@ async fn handle_create_room_mapping(
             )
         }
         Err(e) => {
-            error!("create room mapping failed: {e}");
+            error!(
+                orphaned_room_id = %matrix_room_id,
+                "create room mapping failed (orphaned room may need cleanup): {e}"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "internal error",
-                    "matrix_room_id": matrix_room_id,
-                })),
+                Json(json!({ "error": "internal error" })),
             )
         }
     }

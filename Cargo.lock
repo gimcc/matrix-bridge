@@ -1316,6 +1316,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "getrandom 0.2.17",
  "indexmap",
  "matrix-bridge-appservice",
  "matrix-bridge-core",
