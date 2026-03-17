@@ -622,6 +622,35 @@ impl MatrixClient {
         }
     }
 
+    /// Query the m.room.encryption state event for a room.
+    ///
+    /// Returns `Ok(Some(content))` if the room is encrypted, `Ok(None)` if not,
+    /// or an error if the request failed.
+    pub async fn get_room_encryption_event(&self, room_id: &str) -> anyhow::Result<Option<Value>> {
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.encryption/",
+            self.homeserver_url,
+            urlencoding::encode(room_id),
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.as_token)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let body: Value = resp.json().await?;
+            Ok(Some(body))
+        } else if resp.status().as_u16() == 404 {
+            Ok(None)
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get room encryption state failed: {text}");
+        }
+    }
+
     /// Get the members of a room.
     pub async fn get_room_members(&self, room_id: &str) -> anyhow::Result<Vec<String>> {
         let url = format!(

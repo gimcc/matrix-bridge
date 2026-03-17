@@ -112,8 +112,10 @@ async fn handle_transaction(
     //   1. Upload new one-time keys when the count drops
     //   2. Track device-list changes for room members
     if let Some(crypto) = &state.crypto_manager {
+        // Support both unstable (de.sorunome.msc2409) and stable (org.matrix.msc2409) prefixes.
         let to_device_events = body
             .get("de.sorunome.msc2409.to_device")
+            .or_else(|| body.get("org.matrix.msc2409.to_device"))
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
@@ -127,18 +129,25 @@ async fn handle_transaction(
             })
             .collect();
 
+        // Support both unstable (de.sorunome.msc3202) and stable (org.matrix.msc3202) prefixes.
+        // Newer Synapse versions use org.matrix.msc3202, older ones use de.sorunome.msc3202.
         let changed_devices: ruma::api::client::sync::sync_events::DeviceLists = body
-            .get("de.sorunome.msc3202.device_lists")
+            .get("org.matrix.msc3202.device_lists")
+            .or_else(|| body.get("de.sorunome.msc3202.device_lists"))
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
         let otk_counts: BTreeMap<ruma::OneTimeKeyAlgorithm, ruma::UInt> = body
-            .get("de.sorunome.msc3202.device_one_time_keys_count")
+            .get("org.matrix.msc3202.device_one_time_keys_count")
+            .or_else(|| body.get("de.sorunome.msc3202.device_one_time_keys_count"))
+            // Also handle the typo'd field name some Synapse versions use.
+            .or_else(|| body.get("org.matrix.msc3202.device_one_time_key_counts"))
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
         let fallback_keys: Option<Vec<ruma::OneTimeKeyAlgorithm>> = body
-            .get("de.sorunome.msc3202.device_unused_fallback_key_types")
+            .get("org.matrix.msc3202.device_unused_fallback_key_types")
+            .or_else(|| body.get("de.sorunome.msc3202.device_unused_fallback_key_types"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
         if !raw_events.is_empty() || !changed_devices.changed.is_empty() || !otk_counts.is_empty()
