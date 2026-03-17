@@ -5,4 +5,3 @@ pub mod dispatcher;
 pub mod matrix_client;
 pub mod puppet_manager;
 pub mod server;
-pub mod webhook_platform;

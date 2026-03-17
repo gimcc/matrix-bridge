@@ -19,15 +19,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
-async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 ruma = { version = "0.14", features = ["client-api-c", "appservice-api-s", "events", "html"] }
 dashmap = "6"
-uuid = { version = "1", features = ["v4"] }
-futures = "0.3"
 matrix-sdk-crypto = { version = "0.16", features = ["automatic-room-key-forwarding"] }
 matrix-sdk-sqlite = { version = "0.16", features = ["crypto-store"] }
-vodozemac = "0.9"
 subtle = "2"
 ulid = "1"
 indexmap = "2"

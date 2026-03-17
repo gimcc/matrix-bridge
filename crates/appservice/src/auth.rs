@@ -1,60 +1,88 @@
 use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 use subtle::ConstantTimeEq;
 
-/// Extract and verify the hs_token from the request.
+/// Extract a Bearer token from the request.
 ///
-/// Accepts two formats (checked in order):
-/// 1. `Authorization: Bearer {token}` header (Synapse 1.149+)
+/// Checks two locations (in order):
+/// 1. `Authorization: Bearer {token}` header
 /// 2. `access_token={token}` query parameter (legacy)
-///
-/// Uses constant-time comparison to prevent timing side-channel attacks.
-pub async fn verify_hs_token(request: Request, next: Next) -> Result<Response, StatusCode> {
-    let expected_token = request
-        .extensions()
-        .get::<HsToken>()
-        .map(|t| t.0.clone())
-        .unwrap_or_default();
-
-    // Try Authorization: Bearer header first, then fall back to query param.
-    let token_from_header = request
+fn extract_bearer_token(request: &Request) -> Option<String> {
+    let from_header = request
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    let token_from_query = {
+    let from_query = {
         let query = request.uri().query().unwrap_or("");
         parse_access_token(query).map(|s| s.to_string())
     };
 
-    let token = token_from_header.or(token_from_query);
+    from_header.or(from_query)
+}
 
-    match token {
-        Some(t) if constant_time_eq(t.as_bytes(), expected_token.as_bytes()) => {
-            Ok(next.run(request).await)
-        }
+/// Verify that the request carries a valid token (constant-time comparison).
+fn verify_token(provided: &str, expected: &str) -> bool {
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+/// Middleware: verify the homeserver token (`hs_token`) on Matrix appservice routes.
+///
+/// This authenticates requests from the Matrix homeserver (Synapse).
+/// Uses constant-time comparison to prevent timing side-channel attacks.
+pub async fn verify_hs_token(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let Some(HsToken(expected)) = request.extensions().get::<HsToken>().cloned() else {
+        tracing::error!("HsToken extension missing — route misconfiguration");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    match extract_bearer_token(&request) {
+        Some(t) if verify_token(&t, &expected) => Ok(next.run(request).await),
         Some(_) => {
             tracing::warn!("invalid hs_token in request");
             Err(StatusCode::FORBIDDEN)
         }
         None => {
-            tracing::warn!("missing access_token in request");
+            tracing::warn!("missing hs_token in request");
             Err(StatusCode::UNAUTHORIZED)
         }
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Middleware: verify the API key on Bridge HTTP API routes.
+///
+/// This authenticates requests from external platform services.
+/// Separate from `hs_token` which is a Matrix protocol secret.
+pub async fn verify_api_key(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let Some(ApiKey(expected)) = request.extensions().get::<ApiKey>().cloned() else {
+        tracing::error!("ApiKey extension missing — route misconfiguration");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    match extract_bearer_token(&request) {
+        Some(t) if verify_token(&t, &expected) => Ok(next.run(request).await),
+        Some(_) => {
+            tracing::warn!("invalid api_key in bridge API request");
+            Err(StatusCode::FORBIDDEN)
+        }
+        None => {
+            tracing::warn!("missing api_key in bridge API request");
+            Err(StatusCode::UNAUTHORIZED)
+        }
     }
-    a.ct_eq(b).into()
 }
 
-/// Newtype for the homeserver token, stored in axum extensions.
+/// Newtype for the homeserver token (Synapse ↔ appservice), stored in axum extensions.
 #[derive(Clone)]
 pub struct HsToken(pub String);
+
+/// Newtype for the Bridge API key (external services ↔ bridge), stored in axum extensions.
+#[derive(Clone)]
+pub struct ApiKey(pub String);
 
 fn parse_access_token(query: &str) -> Option<&str> {
     for pair in query.split('&') {
@@ -94,5 +122,14 @@ mod tests {
             "Bearer prefix is case-sensitive"
         );
         assert_eq!("Basic abc123".strip_prefix("Bearer "), None,);
+    }
+
+    #[test]
+    fn test_verify_token() {
+        assert!(verify_token("secret123", "secret123"));
+        assert!(!verify_token("secret123", "wrong"));
+        assert!(!verify_token("short", "longer_token"));
+        assert!(!verify_token("", "notempty"));
+        assert!(verify_token("", ""));
     }
 }
