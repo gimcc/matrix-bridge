@@ -6,14 +6,42 @@ All request/response bodies are JSON unless otherwise noted.
 
 ---
 
+## Authentication
+
+The Bridge API (`/api/v1/*`) supports optional API key authentication, configured separately from the Matrix `hs_token`.
+
+| Config Field | Default | Description |
+|---|---|---|
+| `appservice.api_key` | _(empty)_ | When set, all `/api/v1/*` requests require this key |
+
+When `api_key` is configured, include it in every request via one of:
+
+```
+Authorization: Bearer <api_key>
+```
+
+or as a query parameter:
+
+```
+GET /api/v1/rooms?platform=myapp&access_token=<api_key>
+```
+
+When `api_key` is not set (default), the Bridge API requires no authentication. This is suitable for internal/trusted-network deployments where access control is handled at the network level (firewall, reverse proxy, etc.).
+
+> **Note:** `api_key` is independent from `hs_token`. The `hs_token` is a Matrix protocol secret used exclusively between Synapse and the bridge on `/_matrix/app/v1/*` routes. External services should never use or know the `hs_token`.
+
+---
+
 ## Table of Contents
 
+- [Authentication](#authentication)
 - [Health Check](#health-check)
 - [Send Inbound Message](#send-inbound-message)
 - [Upload Media](#upload-media)
 - [Room Mappings](#room-mappings)
 - [Webhooks](#webhooks)
 - [Webhook Callback Format](#webhook-callback-format-outbound)
+- [SSRF Protection](#ssrf-protection)
 - [Content Types](#content-types)
 - [Puppet User Naming](#puppet-user-naming)
 
@@ -107,6 +135,8 @@ POST /api/v1/upload
 ```
 
 Uploads a file to the Matrix content repository. Use the returned `content_uri` in message content fields (e.g. `url` for image/file/video/audio types).
+
+**Maximum file size: 200 MB.** Requests exceeding this limit receive a `413 Payload Too Large` response.
 
 ### Request
 
@@ -221,7 +251,7 @@ POST /api/v1/webhooks
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `platform` | string | Yes | Platform identifier for this webhook |
-| `url` | string | Yes | Callback URL that will receive POST requests |
+| `url` | string | Yes | Callback URL that will receive POST requests (must use `http` or `https` scheme; see [SSRF Protection](#ssrf-protection) below) |
 | `events` | string | No | Event types to subscribe to (default: `"message"`) |
 | `exclude_sources` | array or string | No | Source platforms to exclude from forwarding; accepts a JSON array `["telegram", "discord"]` or a comma-separated string `"telegram,discord"` |
 
@@ -378,6 +408,18 @@ A Telegram puppet user sends a message in a room that is also mapped to Slack. T
 | `message.content` | object | Message content (see [Content Types](#content-types)) |
 | `message.timestamp` | number | Unix timestamp in milliseconds |
 | `message.reply_to` | string or null | Event ID of the message being replied to |
+
+---
+
+## SSRF Protection
+
+Webhook URLs always require `http` or `https` scheme. When `appservice.webhook_ssrf_protection = true` is set in the config, additional checks block URLs targeting private/reserved networks:
+
+- **Blocked IPs:** loopback (127.0.0.0/8, ::1), RFC1918 (10/8, 172.16/12, 192.168/16), link-local (169.254/16, fe80::/10), CGNAT (100.64/10), IPv6 ULA (fc00::/7), unspecified (0.0.0.0, ::), broadcast, documentation ranges, cloud metadata (169.254.169.254)
+- **DNS resolution:** hostnames are resolved and all resulting IPs are checked, preventing rebinding attacks (e.g. `127.0.0.1.nip.io`)
+- **IPv4-mapped IPv6:** addresses like `::ffff:10.0.0.1` are unwrapped and checked against IPv4 rules
+
+Default is `false` (allow all targets), suitable for internal deployments.
 
 ---
 

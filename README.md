@@ -47,6 +47,8 @@ docker compose up -d
 ## Usage Example
 
 ```bash
+# If api_key is configured, add: -H "Authorization: Bearer <api_key>"
+
 # Link an external room to a Matrix room
 curl -X POST http://bridge:29320/api/v1/rooms \
   -H "Content-Type: application/json" \
@@ -92,8 +94,7 @@ curl -X POST http://bridge:29320/api/v1/message \
 crates/
 ├── core/          # Shared types: BridgeMessage, ExternalUser, config
 ├── store/         # SQLite: room mappings, message mappings, puppets, webhooks
-├── appservice/    # HTTP server, dispatcher, puppet manager, crypto, auth
-└── bridge-telegram/  # (WIP) Native Telegram bridge
+└── appservice/    # HTTP server, dispatcher, puppet manager, crypto, auth
 src/main.rs        # Entry point
 docs/              # Documentation (EN + ZH)
 examples/          # Integration demo code

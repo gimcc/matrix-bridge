@@ -57,6 +57,20 @@ as_token = "CHANGE_ME_AS_TOKEN"
 # 请生成一个随机字符串。
 hs_token = "CHANGE_ME_HS_TOKEN"
 
+# Bridge HTTP API (/api/v1/*) 的可选 API Key。
+# 设置后，外部服务请求 /api/v1/* 时必须携带此密钥：
+#   Authorization: Bearer <api_key>  或  ?access_token=<api_key>
+# 未设置时（默认），Bridge API 无需认证——
+# 适用于内部/可信网络部署。
+# 此密钥与 hs_token（Matrix 协议密钥）完全独立。
+# 生成方式：openssl rand -hex 32
+# api_key = "YOUR_BRIDGE_API_KEY"
+
+# 是否拦截指向私有/保留 IP 的 Webhook URL（SSRF 防护）。
+# 默认值：false（允许私有 IP——适用于内部部署）。
+# 当桥接器暴露到不可信网络时应设为 true。
+# webhook_ssrf_protection = true
+
 # ─── 数据库 ───────────────────────────────────────────────────
 [database]
 # SQLite 数据库文件路径。

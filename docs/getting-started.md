@@ -58,6 +58,21 @@ as_token = "CHANGE_ME_AS_TOKEN"
 # requests TO Synapse. Generate a random string.
 hs_token = "CHANGE_ME_HS_TOKEN"
 
+# Optional API key for the Bridge HTTP API (/api/v1/*).
+# When set, external services must include this key via:
+#   Authorization: Bearer <api_key>  OR  ?access_token=<api_key>
+# When omitted (default), the Bridge API requires no authentication
+# — suitable for internal/trusted-network deployments.
+# This is separate from hs_token (Matrix protocol secret).
+# Generate: openssl rand -hex 32
+# api_key = "YOUR_BRIDGE_API_KEY"
+
+# Block webhook URLs targeting private/reserved IP ranges
+# (SSRF protection). Default: false (allow private IPs — for
+# internal deployments). Set to true when exposed to untrusted
+# networks.
+# webhook_ssrf_protection = true
+
 # ─── Database ─────────────────────────────────────────────────
 [database]
 # Path to the SQLite database file.

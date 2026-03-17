@@ -627,7 +627,7 @@ async fn handle_upload(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    const MAX_UPLOAD_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+    const MAX_UPLOAD_SIZE: usize = 200 * 1024 * 1024; // 200 MB
 
     let data = match field.bytes().await {
         Ok(b) => b.to_vec(),

@@ -21,12 +21,11 @@ Matrix Bridge is a Rust application service that bridges Matrix rooms with exter
 
 | Crate | Path | Responsibility |
 |-------|------|----------------|
-| `matrix-bridge-core` | `crates/core` | Shared types: `BridgeMessage`, `MessageContent`, `ExternalUser`, `BridgePlatform` trait, `AppConfig`, error types, registration YAML generation |
+| `matrix-bridge-core` | `crates/core` | Shared types: `BridgeMessage`, `MessageContent`, `ExternalUser`, `AppConfig`, error types, registration YAML generation |
 | `matrix-bridge-store` | `crates/store` | SQLite database layer: `Database`, migrations, CRUD for room_mappings, message_mappings, puppets, webhooks |
 | `matrix-bridge-appservice` | `crates/appservice` | Application service runtime: HTTP server (axum), Dispatcher, PuppetManager, MatrixClient, CryptoManager, Bridge HTTP API, auth middleware |
 | `matrix-bridge` (bin) | `src/main.rs` | Entry point: loads config, opens database, initializes all components, starts HTTP server |
 
-There is also a `crates/bridge-telegram` placeholder for a native Telegram platform plugin.
 
 ### Main Components
 
@@ -586,12 +585,14 @@ message_mappings
 | GET | `/_matrix/app/v1/users/{userId}` | User existence query |
 | GET | `/_matrix/app/v1/rooms/{roomAlias}` | Room alias query |
 
-### Bridge API Endpoints (no auth currently)
+### Bridge API Endpoints (optional `api_key` auth)
+
+When `appservice.api_key` is set, every request to `/api/v1/*` must include the key via `Authorization: Bearer <api_key>` or `?access_token=<api_key>`. When omitted (default), no authentication is required -- suitable for internal/trusted-network deployments.
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/api/v1/message` | Send message from external platform to Matrix |
-| POST | `/api/v1/upload` | Upload media, returns `mxc://` URI |
+| POST | `/api/v1/upload` | Upload media (max 200 MB), returns `mxc://` URI |
 | POST | `/api/v1/rooms` | Create room mapping |
 | GET | `/api/v1/rooms?platform=X` | List room mappings |
 | DELETE | `/api/v1/rooms/{id}` | Delete room mapping |
@@ -599,6 +600,18 @@ message_mappings
 | GET | `/api/v1/webhooks[?platform=X]` | List webhooks |
 | DELETE | `/api/v1/webhooks/{id}` | Delete webhook |
 | GET | `/health` | Health check |
+
+### Webhook SSRF Protection
+
+When `appservice.webhook_ssrf_protection = true`, webhook URL registration blocks:
+- RFC1918 private addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+- Loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16, fe80::/10)
+- CGNAT (100.64.0.0/10), IPv6 ULA (fc00::/7)
+- Cloud metadata endpoints (169.254.169.254, metadata.google.internal)
+- IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+- DNS names resolving to any of the above (prevents rebinding attacks)
+
+Default is `false` (allow private IPs), suitable for internal deployments where webhook targets are on the same private network. Enable when the bridge is exposed to untrusted networks.
 
 ### In-Room Commands
 

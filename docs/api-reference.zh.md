@@ -6,14 +6,42 @@
 
 ---
 
+## 认证
+
+Bridge API（`/api/v1/*`）支持可选的 API Key 认证，与 Matrix `hs_token` 独立配置。
+
+| 配置字段 | 默认值 | 说明 |
+|---|---|---|
+| `appservice.api_key` | _（空）_ | 设置后，所有 `/api/v1/*` 请求需携带此密钥 |
+
+配置了 `api_key` 后，每个请求需通过以下方式之一携带密钥：
+
+```
+Authorization: Bearer <api_key>
+```
+
+或作为查询参数：
+
+```
+GET /api/v1/rooms?platform=myapp&access_token=<api_key>
+```
+
+未配置 `api_key` 时（默认），Bridge API 不需要认证。适用于内部/可信网络部署，由网络层（防火墙、反向代理等）控制访问。
+
+> **注意：** `api_key` 与 `hs_token` 完全独立。`hs_token` 是 Matrix 协议密钥，仅用于 Synapse 与桥接器之间的 `/_matrix/app/v1/*` 路由。外部服务不应使用或知晓 `hs_token`。
+
+---
+
 ## 目录
 
+- [认证](#认证)
 - [健康检查](#健康检查)
 - [发送入站消息](#发送入站消息)
 - [上传媒体文件](#上传媒体文件)
 - [房间映射管理](#房间映射管理)
 - [Webhook 管理](#webhook-管理)
 - [Webhook 回调格式](#webhook-回调格式出站)
+- [SSRF 防护](#ssrf-防护)
 - [消息内容类型](#消息内容类型)
 - [傀儡用户命名规则](#傀儡用户命名规则)
 
@@ -107,6 +135,8 @@ POST /api/v1/upload
 ```
 
 将文件上传到 Matrix 内容仓库。返回的 `content_uri` 可用于消息内容中的 `url` 字段（如 image、file、video、audio 类型）。
+
+**最大文件大小：200 MB。** 超过限制的请求会收到 `413 Payload Too Large` 响应。
 
 ### 请求
 
@@ -221,7 +251,7 @@ POST /api/v1/webhooks
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `platform` | string | 是 | 该 Webhook 所属的平台标识 |
-| `url` | string | 是 | 接收回调的 URL |
+| `url` | string | 是 | 接收回调的 URL（必须使用 `http` 或 `https` 协议；参见 [SSRF 防护](#ssrf-防护)） |
 | `events` | string | 否 | 订阅的事件类型（默认 `"message"`） |
 | `exclude_sources` | array 或 string | 否 | 需要排除的来源平台；支持 JSON 数组 `["telegram", "discord"]` 或逗号分隔字符串 `"telegram,discord"` |
 
@@ -378,6 +408,18 @@ DELETE /api/v1/webhooks/{id}
 | `message.content` | object | 消息内容（见[消息内容类型](#消息内容类型)） |
 | `message.timestamp` | number | Unix 时间戳（毫秒） |
 | `message.reply_to` | string 或 null | 所回复消息的事件 ID |
+
+---
+
+## SSRF 防护
+
+Webhook URL 始终要求使用 `http` 或 `https` 协议。当配置中设置 `appservice.webhook_ssrf_protection = true` 时，会额外拦截指向私有/保留网络的 URL：
+
+- **拦截的 IP 范围：** 回环地址（127.0.0.0/8、::1）、RFC1918（10/8、172.16/12、192.168/16）、链路本地（169.254/16、fe80::/10）、CGNAT（100.64/10）、IPv6 ULA（fc00::/7）、未指定地址（0.0.0.0、::）、广播地址、文档保留地址、云元数据（169.254.169.254）
+- **DNS 解析检查：** 域名会被解析，所有结果 IP 均经过检查，防止 DNS 重绑定攻击（如 `127.0.0.1.nip.io`）
+- **IPv4 映射的 IPv6：** 如 `::ffff:10.0.0.1` 会被展开后按 IPv4 规则检查
+
+默认值为 `false`（允许所有目标），适用于内部部署场景。
 
 ---
 
