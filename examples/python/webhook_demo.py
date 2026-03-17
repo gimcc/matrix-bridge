@@ -19,7 +19,7 @@ Environment variables:
     BRIDGE_URL   - Base URL of the bridge API (default: http://localhost:29320)
     PLATFORM     - Platform identifier registered with the bridge (default: myapp)
     ROOM_ID      - External room ID to bridge (default: general)
-    MATRIX_ROOM_ID - Matrix room ID to bridge (e.g. !abc:example.com)
+    MATRIX_ROOM_ID - Matrix room ID (optional; bridge auto-creates if omitted)
     WEBHOOK_PORT - Port this demo listens on (default: 5050)
     WEBHOOK_HOST - Host for the webhook callback URL (default: http://localhost:5050)
 """
@@ -41,7 +41,7 @@ from flask import Flask, Request, jsonify, request
 BRIDGE_URL: str = os.environ.get("BRIDGE_URL", "http://localhost:29320")
 PLATFORM: str = os.environ.get("PLATFORM", "myapp")
 ROOM_ID: str = os.environ.get("ROOM_ID", "general")
-MATRIX_ROOM_ID: str = os.environ.get("MATRIX_ROOM_ID", "!changeme:example.com")
+MATRIX_ROOM_ID: str | None = os.environ.get("MATRIX_ROOM_ID")  # optional: auto-created if omitted
 WEBHOOK_PORT: int = int(os.environ.get("WEBHOOK_PORT", "5050"))
 WEBHOOK_HOST: str = os.environ.get("WEBHOOK_HOST", f"http://localhost:{WEBHOOK_PORT}")
 
@@ -231,11 +231,12 @@ def create_room_mapping() -> dict:
     This tells the bridge which Matrix room corresponds to our external
     room identifier.
     """
-    payload = {
+    payload: dict = {
         "platform": PLATFORM,
         "external_room_id": ROOM_ID,
-        "matrix_room_id": MATRIX_ROOM_ID,
     }
+    if MATRIX_ROOM_ID:
+        payload["matrix_room_id"] = MATRIX_ROOM_ID
 
     resp = requests.post(f"{BRIDGE_URL}/api/v1/rooms", json=payload, timeout=10)
     resp.raise_for_status()

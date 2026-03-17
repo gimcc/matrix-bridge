@@ -278,7 +278,8 @@ impl MatrixClient {
             let room_id = data
                 .get("room_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("create room response missing room_id: {data}"))?
                 .to_string();
             debug!(room_id, "room created");
             Ok(room_id)
@@ -289,6 +290,9 @@ impl MatrixClient {
     }
 
     /// Invite a user to a room (as the bridge bot).
+    ///
+    /// Silently succeeds if the user is already in the room (`M_FORBIDDEN`
+    /// with "already in the room" from Synapse).
     pub async fn invite_user(&self, room_id: &str, user_id: &str) -> anyhow::Result<()> {
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/invite",
@@ -306,6 +310,16 @@ impl MatrixClient {
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
+            // Synapse returns M_FORBIDDEN with "already in the room" when the
+            // user has already joined.  Check both errcode and message to avoid
+            // swallowing unrelated M_FORBIDDEN errors (e.g. missing permission).
+            if let Ok(body) = serde_json::from_str::<Value>(&text) {
+                let errcode = body.get("errcode").and_then(|v| v.as_str()).unwrap_or("");
+                if errcode == "M_FORBIDDEN" && text.contains("already in the room") {
+                    debug!("{user_id} already in {room_id}, skipping invite");
+                    return Ok(());
+                }
+            }
             anyhow::bail!("failed to invite {user_id} to {room_id}: {text}");
         }
         Ok(())
@@ -364,11 +378,18 @@ impl MatrixClient {
             urlencoding::encode(txn_id),
         );
 
+        let mut query: Vec<(&str, String)> = vec![("user_id", as_user.to_string())];
+        // MSC3202/MSC4190: include device_id so Synapse knows which device
+        // encrypted the content (bridge bot's single device).
+        if let Some(ref did) = self.device_id {
+            query.push(("device_id", did.clone()));
+        }
+
         let resp = self
             .client
             .put(&url)
             .bearer_auth(&self.as_token)
-            .query(&[("user_id", as_user)])
+            .query(&query)
             .json(content)
             .send()
             .await?;

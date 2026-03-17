@@ -19,7 +19,7 @@
  *     BRIDGE_URL   - Base URL of the bridge API (default: http://localhost:29320)
  *     PLATFORM     - Platform identifier registered with the bridge (default: myapp)
  *     ROOM_ID      - External room ID to bridge (default: general)
- *     MATRIX_ROOM_ID - Matrix room ID to bridge (e.g. !abc:example.com)
+ *     MATRIX_ROOM_ID - Matrix room ID (optional; bridge auto-creates if omitted)
  *     WEBHOOK_PORT - Port this demo listens on (default: 5050)
  *     WEBHOOK_HOST - Host for the webhook callback URL (default: http://localhost:5050)
  */
@@ -35,7 +35,7 @@ import { basename } from "node:path";
 const BRIDGE_URL = process.env.BRIDGE_URL ?? "http://localhost:29320";
 const PLATFORM = process.env.PLATFORM ?? "myapp";
 const ROOM_ID = process.env.ROOM_ID ?? "general";
-const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID ?? "!changeme:example.com";
+const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID; // optional: bridge auto-creates if omitted
 const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 5050);
 const WEBHOOK_HOST =
   process.env.WEBHOOK_HOST ?? `http://localhost:${WEBHOOK_PORT}`;
@@ -263,8 +263,10 @@ async function createRoomMapping() {
   const payload = {
     platform: PLATFORM,
     external_room_id: ROOM_ID,
-    matrix_room_id: MATRIX_ROOM_ID,
   };
+  if (MATRIX_ROOM_ID) {
+    payload.matrix_room_id = MATRIX_ROOM_ID;
+  }
 
   const resp = await fetch(`${BRIDGE_URL}/api/v1/rooms`, {
     method: "POST",

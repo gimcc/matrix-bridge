@@ -127,11 +127,22 @@ pub struct SendMessageResponse {
 }
 
 /// Request body for creating a room mapping.
+///
+/// When `matrix_room_id` is omitted, the bridge automatically creates a new
+/// Matrix room and uses its ID for the mapping.
 #[derive(Debug, Deserialize)]
 pub struct CreateRoomMappingRequest {
     pub platform: String,
     pub external_room_id: String,
-    pub matrix_room_id: String,
+    /// If `None`, the bridge auto-creates a Matrix room.
+    pub matrix_room_id: Option<String>,
+    /// Optional room name used when auto-creating (ignored if `matrix_room_id`
+    /// is provided).
+    pub room_name: Option<String>,
+    /// Extra Matrix user IDs to invite when auto-creating a room.
+    /// Only effective when `allow_api_invite = true` in server config.
+    #[serde(default)]
+    pub invite: Vec<String>,
 }
 
 /// Request body for registering a webhook.
@@ -423,30 +434,167 @@ async fn handle_send_message(
 }
 
 /// POST /api/v1/rooms
+///
+/// Idempotent: if a mapping for `(platform, external_room_id)` already exists,
+/// returns the existing mapping (200). Otherwise creates a new one (201).
+/// When `matrix_room_id` is omitted and no existing mapping is found, the
+/// bridge auto-creates a new Matrix room.
 async fn handle_create_room_mapping(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateRoomMappingRequest>,
 ) -> impl IntoResponse {
     let dispatcher = state.dispatcher.lock().await;
+
+    // Check for an existing mapping first.
     match dispatcher
         .db()
-        .create_room_mapping(&req.matrix_room_id, &req.platform, &req.external_room_id)
+        .find_room_by_external_id(&req.platform, &req.external_room_id)
+        .await
+    {
+        Ok(Some(existing)) => {
+            // If caller provided a specific matrix_room_id that differs, update it.
+            if let Some(ref wanted) = req.matrix_room_id {
+                if !wanted.is_empty() && wanted != &existing.matrix_room_id {
+                    match dispatcher
+                        .db()
+                        .create_room_mapping(wanted, &req.platform, &req.external_room_id)
+                        .await
+                    {
+                        Ok(id) => {
+                            info!(
+                                platform = req.platform,
+                                external = req.external_room_id,
+                                matrix = %wanted,
+                                "room mapping updated via API"
+                            );
+                            return (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id": id,
+                                    "matrix_room_id": wanted,
+                                })),
+                            );
+                        }
+                        Err(e) => {
+                            error!("update room mapping failed: {e}");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({ "error": "internal error" })),
+                            );
+                        }
+                    }
+                }
+            }
+            // Existing mapping matches — return as-is.
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "id": existing.id,
+                    "matrix_room_id": existing.matrix_room_id,
+                })),
+            );
+        }
+        Ok(None) => {} // No existing mapping — proceed to create.
+        Err(e) => {
+            error!("find room mapping failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            );
+        }
+    }
+
+    // Resolve the Matrix room ID: use the provided one or auto-create.
+    let matrix_room_id = match req.matrix_room_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            // Global auto_invite always applied; per-request invite only if config allows.
+            let mut invite_users: Vec<String> = state.auto_invite.clone();
+            if state.allow_api_invite {
+                for u in &req.invite {
+                    if !invite_users.contains(u) {
+                        invite_users.push(u.clone());
+                    }
+                }
+            }
+            let invite_refs: Vec<&str> = invite_users.iter().map(|s| s.as_str()).collect();
+
+            let room_name = req.room_name.as_deref().unwrap_or(&req.external_room_id);
+            match dispatcher
+                .matrix_client()
+                .create_room(Some(room_name), &invite_refs, state.encryption_default)
+                .await
+            {
+                Ok(id) => {
+                    // Register encryption state and track member devices so
+                    // other clients share Megolm session keys with the bridge.
+                    if state.encryption_default {
+                        if let Some(crypto) = &state.crypto_manager {
+                            if let Ok(ruma_room_id) =
+                                <&ruma::RoomId>::try_from(id.as_str())
+                            {
+                                if let Err(e) = crypto.set_room_encrypted(ruma_room_id).await {
+                                    error!(room_id = %id, "failed to mark room as encrypted: {e}");
+                                }
+                                // Query device keys for invited members.
+                                let members: Vec<ruma::OwnedUserId> = invite_users
+                                    .iter()
+                                    .filter_map(|u| u.parse().ok())
+                                    .collect();
+                                if !members.is_empty() {
+                                    if let Err(e) = crypto.update_tracked_users(&members).await {
+                                        error!(room_id = %id, "failed to track user devices: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    info!(
+                        room_id = %id,
+                        invited = ?invite_users,
+                        "auto-created Matrix room for mapping"
+                    );
+                    id
+                }
+                Err(e) => {
+                    error!("auto-create room failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "failed to create room" })),
+                    );
+                }
+            }
+        }
+    };
+
+    match dispatcher
+        .db()
+        .create_room_mapping(&matrix_room_id, &req.platform, &req.external_room_id)
         .await
     {
         Ok(id) => {
             info!(
                 platform = req.platform,
                 external = req.external_room_id,
-                matrix = req.matrix_room_id,
+                matrix = matrix_room_id,
                 "room mapping created via API"
             );
-            (StatusCode::CREATED, Json(json!({ "id": id })))
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": id,
+                    "matrix_room_id": matrix_room_id,
+                })),
+            )
         }
         Err(e) => {
             error!("create room mapping failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal error" })),
+                Json(json!({
+                    "error": "internal error",
+                    "matrix_room_id": matrix_room_id,
+                })),
             )
         }
     }

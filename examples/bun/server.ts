@@ -13,7 +13,7 @@
  *     BRIDGE_URL     - Base URL of the bridge API (default: http://localhost:29320)
  *     PLATFORM       - Platform identifier (default: web)
  *     ROOM_ID        - External room ID to bridge (default: general)
- *     MATRIX_ROOM_ID - Matrix room ID (e.g. !abc:example.com)
+ *     MATRIX_ROOM_ID - Matrix room ID (optional; bridge auto-creates if omitted)
  *     PORT           - Port this demo listens on (default: 3030)
  *     HOST           - Public URL the bridge can reach (default: http://localhost:3030)
  */
@@ -25,7 +25,7 @@
 const BRIDGE_URL = process.env.BRIDGE_URL ?? "http://localhost:29320";
 const PLATFORM = process.env.PLATFORM ?? "web";
 const ROOM_ID = process.env.ROOM_ID ?? "general";
-const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID ?? "!changeme:example.com";
+const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID; // optional: bridge auto-creates if omitted
 const PORT = Number(process.env.PORT ?? 3030);
 const HOST = process.env.HOST ?? `http://localhost:${PORT}`;
 
@@ -44,16 +44,25 @@ interface ChatMessage {
 // SSE: push messages to connected browsers
 // ---------------------------------------------------------------------------
 
-const sseClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+// Each SSE client is a Bun direct-stream controller.
+interface SSEClient {
+  ctrl: ReadableStreamDirectController;
+  alive: boolean;
+}
+
+const sseClients = new Set<SSEClient>();
 
 function broadcast(msg: ChatMessage): void {
-  const data = `data: ${JSON.stringify(msg)}\n\n`;
-  const encoded = new TextEncoder().encode(data);
-  for (const controller of sseClients) {
+  console.log(`[broadcast] pushing to ${sseClients.size} SSE client(s)`);
+  const payload = `data: ${JSON.stringify(msg)}\n\n`;
+  for (const client of sseClients) {
     try {
-      controller.enqueue(encoded);
+      client.ctrl.write(payload);
+      client.ctrl.flush();
     } catch {
-      sseClients.delete(controller);
+      console.log("[broadcast] write failed, removing client");
+      client.alive = false;
+      sseClients.delete(client);
     }
   }
 }
@@ -80,7 +89,7 @@ async function setup(): Promise<void> {
   console.log(`  Bridge URL : ${BRIDGE_URL}`);
   console.log(`  Platform   : ${PLATFORM}`);
   console.log(`  Room ID    : ${ROOM_ID}`);
-  console.log(`  Matrix Room: ${MATRIX_ROOM_ID}`);
+  console.log(`  Matrix Room: ${MATRIX_ROOM_ID ?? "(auto-create)"}`);
   console.log(`  Webhook URL: ${HOST}/webhook`);
 
   try {
@@ -94,12 +103,16 @@ async function setup(): Promise<void> {
   }
 
   try {
-    await bridgePost("/api/v1/rooms", {
+    const roomPayload: Record<string, string> = {
       platform: PLATFORM,
       external_room_id: ROOM_ID,
-      matrix_room_id: MATRIX_ROOM_ID,
-    });
-    console.log("  Room mapping created.");
+    };
+    if (MATRIX_ROOM_ID) {
+      roomPayload.matrix_room_id = MATRIX_ROOM_ID;
+    }
+    const roomResult = await bridgePost("/api/v1/rooms", roomPayload);
+    const assignedRoom = (roomResult as { matrix_room_id?: string }).matrix_room_id;
+    console.log(`  Room mapping created. Matrix room: ${assignedRoom ?? MATRIX_ROOM_ID}`);
   } catch (e: unknown) {
     console.warn("  Room mapping failed:", (e as Error).message);
   }
@@ -112,12 +125,26 @@ async function setup(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function handleSSE(): Response {
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      sseClients.add(controller);
-    },
-    cancel(controller) {
-      sseClients.delete(controller);
+  const stream = new ReadableStream({
+    type: "direct",
+    pull(controller: ReadableStreamDirectController) {
+      const client: SSEClient = { ctrl: controller, alive: true };
+      sseClients.add(client);
+      controller.write(": connected\n\n");
+      controller.flush();
+      console.log(`[sse] client connected (${sseClients.size} total)`);
+
+      // Keep the stream open until the client disconnects.
+      return new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (!client.alive) {
+            clearInterval(check);
+            sseClients.delete(client);
+            console.log(`[sse] client disconnected (${sseClients.size} total)`);
+            resolve();
+          }
+        }, 1000);
+      });
     },
   });
 
@@ -148,7 +175,8 @@ async function handleWebhook(req: Request): Promise<Response> {
     timestamp: Date.now(),
   };
 
-  console.log(`[${platform}] ${displayName}: ${body}`);
+  const contentType = (content.type as string) ?? "text";
+  console.log(`[webhook] [${platform}] ${displayName}: [${contentType}] ${body}`);
   broadcast(msg);
   return Response.json({ status: "ok" });
 }
@@ -159,6 +187,8 @@ async function handleSend(req: Request): Promise<Response> {
     sender_name: string;
     body: string;
   };
+
+  console.log(`[send] ${sender_name} (${sender_id}): ${body}`);
 
   const result = await bridgePost("/api/v1/message", {
     platform: PLATFORM,

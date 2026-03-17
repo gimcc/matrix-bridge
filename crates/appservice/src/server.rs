@@ -31,6 +31,12 @@ pub struct AppState {
     pub crypto_manager: Option<Arc<CryptoManager>>,
     /// Whether to block webhook URLs targeting private/reserved IPs.
     pub webhook_ssrf_protection: bool,
+    /// Matrix user IDs to auto-invite when the bridge creates a room.
+    pub auto_invite: Vec<String>,
+    /// Whether to allow the API `invite` field in room creation requests.
+    pub allow_api_invite: bool,
+    /// Whether to auto-enable encryption for newly created rooms.
+    pub encryption_default: bool,
 }
 
 /// Build the axum Router for the appservice HTTP endpoints.
@@ -189,7 +195,7 @@ async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
-/// Start the appservice HTTP server.
+/// Start the appservice HTTP server with graceful shutdown on SIGTERM/SIGINT.
 pub async fn run_server(
     state: Arc<AppState>,
     address: &str,
@@ -201,6 +207,34 @@ pub async fn run_server(
     let bind_addr = format!("{address}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(bind_addr, "appservice HTTP server listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    info!("server shut down gracefully");
     Ok(())
+}
+
+/// Wait for SIGTERM or SIGINT (Ctrl-C) to trigger graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received SIGINT, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+    }
 }
