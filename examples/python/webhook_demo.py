@@ -19,6 +19,7 @@ Environment variables:
     BRIDGE_URL   - Base URL of the bridge API (default: http://localhost:29320)
     PLATFORM     - Platform identifier registered with the bridge (default: myapp)
     ROOM_ID      - External room ID to bridge (default: general)
+    MATRIX_ROOM_ID - Matrix room ID to bridge (e.g. !abc:example.com)
     WEBHOOK_PORT - Port this demo listens on (default: 5050)
     WEBHOOK_HOST - Host for the webhook callback URL (default: http://localhost:5050)
 """
@@ -40,6 +41,7 @@ from flask import Flask, Request, jsonify, request
 BRIDGE_URL: str = os.environ.get("BRIDGE_URL", "http://localhost:29320")
 PLATFORM: str = os.environ.get("PLATFORM", "myapp")
 ROOM_ID: str = os.environ.get("ROOM_ID", "general")
+MATRIX_ROOM_ID: str = os.environ.get("MATRIX_ROOM_ID", "!changeme:example.com")
 WEBHOOK_PORT: int = int(os.environ.get("WEBHOOK_PORT", "5050"))
 WEBHOOK_HOST: str = os.environ.get("WEBHOOK_HOST", f"http://localhost:{WEBHOOK_PORT}")
 
@@ -142,7 +144,7 @@ def upload_media(file_path: str | Path) -> dict:
 
     POST /api/v1/upload  (multipart/form-data)
 
-    Returns a dict that typically includes an ``mxc_url`` (or similar)
+    Returns a dict that includes a ``content_uri`` (mxc:// URI)
     which you then reference in a subsequent message.
     """
     path = Path(file_path)
@@ -173,7 +175,7 @@ def send_image_message(
     """
     # Step 1: upload
     media = upload_media(file_path)
-    mxc_url: str = media.get("mxc_url", media.get("url", ""))
+    mxc_url: str = media.get("content_uri", "")
 
     # Step 2: send image message
     payload = {
@@ -231,7 +233,8 @@ def create_room_mapping() -> dict:
     """
     payload = {
         "platform": PLATFORM,
-        "external_id": ROOM_ID,
+        "external_room_id": ROOM_ID,
+        "matrix_room_id": MATRIX_ROOM_ID,
     }
 
     resp = requests.post(f"{BRIDGE_URL}/api/v1/rooms", json=payload, timeout=10)

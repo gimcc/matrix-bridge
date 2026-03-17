@@ -28,6 +28,7 @@ All configuration is done through environment variables:
 | `BRIDGE_URL`   | `http://localhost:29320`   | Base URL of the bridge API            |
 | `PLATFORM`     | `myapp`                    | Platform identifier for this app      |
 | `ROOM_ID`      | `general`                  | External room ID to bridge            |
+| `MATRIX_ROOM_ID` | `!changeme:example.com` | Matrix room ID to bridge              |
 | `WEBHOOK_PORT` | `5050`                     | Port the demo server listens on       |
 | `WEBHOOK_HOST` | `http://localhost:5050`    | Public URL the bridge can reach       |
 
@@ -113,7 +114,7 @@ POST /api/v1/message
 POST /api/v1/upload   (multipart/form-data, field name: "file")
 ```
 
-Returns a JSON object containing the `mxc_url` to use in a subsequent message
+Returns a JSON object containing the `content_uri` to use in a subsequent message
 with `content.type` set to `"image"` (or other media type).
 
 ### Register webhook
@@ -133,7 +134,7 @@ POST /api/v1/rooms
 ```
 
 ```json
-{ "platform": "myapp", "external_id": "general" }
+{ "platform": "myapp", "external_room_id": "general", "matrix_room_id": "!abc:example.com" }
 ```
 
 ---

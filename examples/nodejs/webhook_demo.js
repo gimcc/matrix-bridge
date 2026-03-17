@@ -19,6 +19,7 @@
  *     BRIDGE_URL   - Base URL of the bridge API (default: http://localhost:29320)
  *     PLATFORM     - Platform identifier registered with the bridge (default: myapp)
  *     ROOM_ID      - External room ID to bridge (default: general)
+ *     MATRIX_ROOM_ID - Matrix room ID to bridge (e.g. !abc:example.com)
  *     WEBHOOK_PORT - Port this demo listens on (default: 5050)
  *     WEBHOOK_HOST - Host for the webhook callback URL (default: http://localhost:5050)
  */
@@ -34,6 +35,7 @@ import { basename } from "node:path";
 const BRIDGE_URL = process.env.BRIDGE_URL ?? "http://localhost:29320";
 const PLATFORM = process.env.PLATFORM ?? "myapp";
 const ROOM_ID = process.env.ROOM_ID ?? "general";
+const MATRIX_ROOM_ID = process.env.MATRIX_ROOM_ID ?? "!changeme:example.com";
 const WEBHOOK_PORT = Number(process.env.WEBHOOK_PORT ?? 5050);
 const WEBHOOK_HOST =
   process.env.WEBHOOK_HOST ?? `http://localhost:${WEBHOOK_PORT}`;
@@ -139,7 +141,7 @@ async function sendTextMessage(
  *
  * POST /api/v1/upload  (multipart/form-data)
  *
- * Returns an object that typically includes an `mxc_url` (or similar) which
+ * Returns an object that includes a `content_uri` (mxc:// URI) which
  * you then reference in a subsequent message.
  *
  * @param {string} filePath - Path to the file on disk
@@ -186,7 +188,7 @@ async function sendImageMessage(
 ) {
   // Step 1: upload
   const media = await uploadMedia(filePath);
-  const mxcUrl = media.mxc_url ?? media.url ?? "";
+  const mxcUrl = media.content_uri ?? "";
 
   // Step 2: send image message
   const payload = {
@@ -260,7 +262,8 @@ async function registerWebhook() {
 async function createRoomMapping() {
   const payload = {
     platform: PLATFORM,
-    external_id: ROOM_ID,
+    external_room_id: ROOM_ID,
+    matrix_room_id: MATRIX_ROOM_ID,
   };
 
   const resp = await fetch(`${BRIDGE_URL}/api/v1/rooms`, {
