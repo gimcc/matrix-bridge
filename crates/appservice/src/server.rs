@@ -105,6 +105,12 @@ async fn handle_transaction(
 
     // Process MSC2409 to-device events and MSC3202 device list/OTK data
     // for end-to-bridge encryption.
+    //
+    // IMPORTANT: always call receive_sync_changes on every transaction,
+    // even when to_device_events is empty.  The OTK counts and device-list
+    // changes arrive independently and must be processed to:
+    //   1. Upload new one-time keys when the count drops
+    //   2. Track device-list changes for room members
     if let Some(crypto) = &state.crypto_manager {
         let to_device_events = body
             .get("de.sorunome.msc2409.to_device")
@@ -112,41 +118,49 @@ async fn handle_transaction(
             .cloned()
             .unwrap_or_default();
 
-        if !to_device_events.is_empty() {
-            let raw_events = to_device_events
-                .into_iter()
-                .filter_map(|v| {
-                    serde_json::value::to_raw_value(&v)
-                        .ok()
-                        .map(ruma::serde::Raw::from_json)
-                })
-                .collect();
+        let raw_events: Vec<_> = to_device_events
+            .into_iter()
+            .filter_map(|v| {
+                serde_json::value::to_raw_value(&v)
+                    .ok()
+                    .map(ruma::serde::Raw::from_json)
+            })
+            .collect();
 
-            let changed_devices: ruma::api::client::sync::sync_events::DeviceLists = body
-                .get("de.sorunome.msc3202.device_lists")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+        let changed_devices: ruma::api::client::sync::sync_events::DeviceLists = body
+            .get("de.sorunome.msc3202.device_lists")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
-            let otk_counts: BTreeMap<ruma::OneTimeKeyAlgorithm, ruma::UInt> = body
-                .get("de.sorunome.msc3202.device_one_time_keys_count")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+        let otk_counts: BTreeMap<ruma::OneTimeKeyAlgorithm, ruma::UInt> = body
+            .get("de.sorunome.msc3202.device_one_time_keys_count")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
-            let fallback_keys: Option<Vec<ruma::OneTimeKeyAlgorithm>> = body
-                .get("de.sorunome.msc3202.device_unused_fallback_key_types")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let fallback_keys: Option<Vec<ruma::OneTimeKeyAlgorithm>> = body
+            .get("de.sorunome.msc3202.device_unused_fallback_key_types")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-            if let Err(e) = crypto
-                .receive_sync_changes(
-                    raw_events,
-                    &changed_devices,
-                    &otk_counts,
-                    fallback_keys.as_deref(),
-                )
-                .await
-            {
-                error!("failed to process to-device events: {e}");
-            }
+        if !raw_events.is_empty() || !changed_devices.changed.is_empty() || !otk_counts.is_empty()
+        {
+            debug!(
+                to_device = raw_events.len(),
+                device_list_changed = changed_devices.changed.len(),
+                otk_counts = otk_counts.len(),
+                "processing MSC2409/3202 crypto data"
+            );
+        }
+
+        if let Err(e) = crypto
+            .receive_sync_changes(
+                raw_events,
+                &changed_devices,
+                &otk_counts,
+                fallback_keys.as_deref(),
+            )
+            .await
+        {
+            error!("failed to process crypto sync changes: {e}");
         }
     }
 

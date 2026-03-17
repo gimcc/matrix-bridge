@@ -12,7 +12,7 @@ use ruma::{
     api::client::sync::sync_events::DeviceLists, events::AnyToDeviceEvent, serde::Raw,
 };
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use matrix_bridge_core::config::EncryptionConfig;
 
@@ -35,6 +35,9 @@ impl CryptoManager {
     /// Initialize the crypto manager for the bridge bot.
     ///
     /// Creates or loads the OlmMachine from a persistent SQLite crypto store.
+    /// After initialization, verifies that device keys are present on the
+    /// homeserver. If missing (stale crypto store from a previous failed
+    /// startup), the store is rebuilt from scratch.
     pub async fn new(
         user_id: &UserId,
         device_id: &ruma::DeviceId,
@@ -52,8 +55,50 @@ impl CryptoManager {
             );
         }
 
-        let store = SqliteCryptoStore::open(store_path, passphrase).await?;
+        let mut cm = Self::open(user_id, device_id, store_path, passphrase, matrix_client.clone()).await?;
 
+        // Upload any pending keys (fresh store) or process OTK replenishment.
+        cm.process_outgoing_requests().await?;
+
+        // Verify that our device keys are actually on the homeserver.
+        // A restored crypto store may believe keys were uploaded when they
+        // never actually reached the server (e.g. previous startup crashed
+        // before the upload completed).  In that case, wipe the store and
+        // re-create from scratch so a fresh upload is generated.
+        if !cm.device_keys_on_server().await? {
+            warn!("device keys missing on server — rebuilding crypto store");
+            // Drop the machine so the SQLite handle is released.
+            drop(cm);
+            if store_path.exists() {
+                std::fs::remove_dir_all(store_path)?;
+                std::fs::create_dir_all(store_path)?;
+            }
+            cm = Self::open(user_id, device_id, store_path, passphrase, matrix_client).await?;
+            cm.process_outgoing_requests().await?;
+
+            if !cm.device_keys_on_server().await? {
+                anyhow::bail!(
+                    "failed to upload device keys after crypto store rebuild — \
+                     check homeserver connectivity and appservice registration"
+                );
+            }
+            info!("device keys uploaded after crypto store rebuild");
+        } else {
+            debug!("device keys verified on server");
+        }
+
+        Ok(cm)
+    }
+
+    /// Open or create the crypto store and build an OlmMachine.
+    async fn open(
+        user_id: &UserId,
+        device_id: &ruma::DeviceId,
+        store_path: &Path,
+        passphrase: Option<&str>,
+        matrix_client: MatrixClient,
+    ) -> anyhow::Result<Self> {
+        let store = SqliteCryptoStore::open(store_path, passphrase).await?;
         let machine = OlmMachine::with_store(user_id, device_id, store, None).await?;
 
         info!(
@@ -66,6 +111,23 @@ impl CryptoManager {
             machine,
             matrix_client,
         })
+    }
+
+    /// Check whether our device keys are present on the homeserver.
+    async fn device_keys_on_server(&self) -> anyhow::Result<bool> {
+        let user_id = self.machine.user_id().to_owned();
+        let req = matrix_sdk_crypto::types::requests::KeysQueryRequest {
+            device_keys: std::collections::BTreeMap::from([(user_id.clone(), Vec::new())]),
+            timeout: Some(std::time::Duration::from_secs(10)),
+        };
+        let resp = self.matrix_client.query_keys_raw(&req).await?;
+
+        let has_device = resp
+            .device_keys
+            .get(&user_id)
+            .map_or(false, |devices| !devices.is_empty());
+
+        Ok(has_device)
     }
 
     /// Upload device keys and one-time keys to the homeserver.

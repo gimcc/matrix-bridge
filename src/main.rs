@@ -263,8 +263,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| "failed to initialize crypto manager")?;
 
-        // Upload initial device keys.
-        cm.process_outgoing_requests().await?;
         info!("end-to-bridge encryption enabled");
 
         Some(Arc::new(cm))
