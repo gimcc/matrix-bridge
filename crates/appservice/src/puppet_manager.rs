@@ -15,14 +15,19 @@ pub struct PuppetManager {
     db: Database,
     /// In-memory cache of already-ensured puppet user IDs.
     cache: DashMap<String, String>,
+    /// Bridge bot device ID for MSC4326 device masquerading.
+    /// When set, each puppet is registered with this device so that
+    /// encrypted messages sent via `user_id=puppet&device_id=X` are accepted.
+    device_id: Option<String>,
 }
 
 impl PuppetManager {
-    pub fn new(matrix_client: MatrixClient, db: Database) -> Self {
+    pub fn new(matrix_client: MatrixClient, db: Database, device_id: Option<String>) -> Self {
         Self {
             matrix_client,
             db,
             cache: DashMap::new(),
+            device_id,
         }
     }
 
@@ -48,6 +53,15 @@ impl PuppetManager {
             .await?;
 
         let matrix_user_id = if let Some(puppet) = existing {
+            // Ensure the bridge bot device exists on this puppet (MSC4326).
+            // This is a no-op if the device was already created; needed after
+            // server restarts when the puppet is in the DB but not yet active.
+            if let Some(ref did) = self.device_id {
+                self.matrix_client
+                    .register_puppet_with_device(localpart, Some(did))
+                    .await?;
+            }
+
             let name_changed = display_name != puppet.display_name.as_deref();
             let avatar_changed = avatar_url != puppet.avatar_mxc.as_deref();
 
@@ -75,7 +89,13 @@ impl PuppetManager {
 
             puppet.matrix_user_id
         } else {
-            let user_id = self.matrix_client.register_puppet(localpart).await?;
+            let user_id = if let Some(ref did) = self.device_id {
+                self.matrix_client
+                    .register_puppet_with_device(localpart, Some(did))
+                    .await?
+            } else {
+                self.matrix_client.register_puppet(localpart).await?
+            };
             info!(
                 platform = platform_id,
                 external_id = external_user_id,

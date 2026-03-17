@@ -122,8 +122,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Create puppet manager.
-    let puppet_manager = Arc::new(PuppetManager::new(matrix_client.clone(), db.clone()));
+    // Create puppet manager (pass device_id so puppets get the bridge device for MSC4326).
+    let puppet_device_id = if config.encryption.allow {
+        Some(config.encryption.device_id.clone())
+    } else {
+        None
+    };
+    let puppet_manager = Arc::new(PuppetManager::new(
+        matrix_client.clone(),
+        db.clone(),
+        puppet_device_id,
+    ));
 
     // Manage registration YAML: generate if missing, regenerate if stale,
     // and verify token consistency.
