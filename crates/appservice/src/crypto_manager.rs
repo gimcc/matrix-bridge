@@ -152,19 +152,6 @@ impl CryptoManager {
         Ok(())
     }
 
-    /// Process only KeysQuery outgoing requests (used during encrypt preparation).
-    async fn process_keys_query_requests(&self) -> anyhow::Result<()> {
-        let outgoing = self.machine.outgoing_requests().await?;
-
-        for request in outgoing {
-            if matches!(request.request(), AnyOutgoingRequest::KeysQuery(_)) {
-                self.dispatch_outgoing_request(request.request_id(), request.request()).await?;
-            }
-        }
-
-        Ok(())
-    }
-
     /// Dispatch a single outgoing request to the homeserver and mark it as sent.
     async fn dispatch_outgoing_request(
         &self,
@@ -173,32 +160,68 @@ impl CryptoManager {
     ) -> anyhow::Result<()> {
         match request {
             AnyOutgoingRequest::KeysUpload(req) => {
+                let otk_count = req.one_time_keys.len();
+                let has_device_keys = req.device_keys.is_some();
                 let resp = self.matrix_client.upload_keys_raw(req).await?;
+                info!(
+                    has_device_keys,
+                    otk_count,
+                    otk_counts = ?resp.one_time_key_counts,
+                    "keys uploaded"
+                );
                 self.machine
                     .mark_request_as_sent(request_id, &resp)
                     .await?;
-                debug!("device keys uploaded");
             }
             AnyOutgoingRequest::KeysQuery(req) => {
+                let queried_users: Vec<String> = req.device_keys.keys()
+                    .map(|u| u.to_string())
+                    .collect();
+                info!(users = ?queried_users, "keys query: requesting device keys");
                 let resp = self.matrix_client.query_keys_raw(req).await?;
+                // Log how many devices we got for each user.
+                for (user_id, devices) in &resp.device_keys {
+                    info!(
+                        user_id = %user_id,
+                        device_count = devices.len(),
+                        device_ids = ?devices.keys().map(|d| d.to_string()).collect::<Vec<_>>(),
+                        "keys query: got devices"
+                    );
+                }
                 self.machine
                     .mark_request_as_sent(request_id, &resp)
                     .await?;
-                debug!("keys query completed");
             }
             AnyOutgoingRequest::KeysClaim(req) => {
+                let claim_users: Vec<String> = req.one_time_keys.keys()
+                    .map(|u| u.to_string())
+                    .collect();
+                info!(users = ?claim_users, "keys claim: claiming OTKs");
                 let resp = self.matrix_client.claim_keys_raw(req).await?;
+                for (user_id, devices) in &resp.one_time_keys {
+                    info!(
+                        user_id = %user_id,
+                        device_count = devices.len(),
+                        "keys claim: got OTKs"
+                    );
+                }
                 self.machine
                     .mark_request_as_sent(request_id, &resp)
                     .await?;
-                debug!("keys claimed");
             }
             AnyOutgoingRequest::ToDeviceRequest(req) => {
+                let recipient_count: usize = req.messages.values()
+                    .map(|devices| devices.len())
+                    .sum();
+                debug!(
+                    event_type = %req.event_type,
+                    recipients = recipient_count,
+                    "sending to-device event"
+                );
                 let resp = self.matrix_client.send_to_device_raw(req).await?;
                 self.machine
                     .mark_request_as_sent(request_id, &resp)
                     .await?;
-                debug!("to-device event sent");
             }
             _ => {
                 debug!("unhandled outgoing request type");
@@ -216,9 +239,15 @@ impl CryptoManager {
         let claim_req = self.machine.get_missing_sessions(refs.into_iter()).await?;
 
         if let Some((txn_id, req)) = claim_req {
+            let claim_users: Vec<String> = req.one_time_keys.keys()
+                .map(|u| u.to_string())
+                .collect();
+            info!(users = ?claim_users, "claiming missing Olm sessions");
             let resp = self.matrix_client.claim_keys_raw(&req).await?;
             self.machine.mark_request_as_sent(&txn_id, &resp).await?;
-            debug!("claimed missing Olm sessions");
+            info!("claimed missing Olm sessions successfully");
+        } else {
+            debug!("no missing Olm sessions to claim");
         }
 
         Ok(())
@@ -266,7 +295,7 @@ impl CryptoManager {
     /// Performs the full preparation flow before encrypting (like matrix-bot-sdk's
     /// `prepareEncrypt`):
     /// 1. Update tracked users for all room members
-    /// 2. Process pending KeysQuery requests
+    /// 2. Process ALL pending outgoing requests (keys query, claim, etc.)
     /// 3. Claim missing Olm sessions
     /// 4. Share Megolm room key with all member devices
     /// 5. Encrypt the event content
@@ -284,12 +313,45 @@ impl CryptoManager {
         // state between preparation and encryption.
         let _guard = self.lock.write().await;
 
-        // Step 1: Ensure all room members are tracked (triggers key queries).
+        info!(
+            room_id = %room_id,
+            member_count = room_members.len(),
+            members = ?room_members.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+            "encrypt: starting preparation"
+        );
+
+        // Step 1: Ensure all room members are tracked.
         let refs: Vec<&UserId> = room_members.iter().map(|u| u.as_ref()).collect();
         self.machine.update_tracked_users(refs).await?;
 
-        // Step 2: Process pending KeysQuery requests to get device keys.
-        self.process_keys_query_requests().await?;
+        // Step 2: Force a fresh device key query for all room members.
+        // `update_tracked_users` is a no-op for already-tracked users, so we
+        // use `query_keys_for_users` which always generates a new KeysQuery
+        // regardless of tracking state.  This ensures we have up-to-date
+        // device information even after bridge restarts or missed device-list
+        // change notifications.
+        {
+            let (txn_id, keys_query_req) = self.machine.query_keys_for_users(
+                room_members.iter().map(|u| u.as_ref()),
+            );
+            let queried_users: Vec<String> = keys_query_req.device_keys.keys()
+                .map(|u| u.to_string())
+                .collect();
+            info!(users = ?queried_users, "encrypt: forced keys query for room members");
+            let resp = self.matrix_client.query_keys_raw(&keys_query_req).await?;
+            for (user_id, devices) in &resp.device_keys {
+                info!(
+                    user_id = %user_id,
+                    device_count = devices.len(),
+                    device_ids = ?devices.keys().map(|d| d.to_string()).collect::<Vec<_>>(),
+                    "encrypt: got devices"
+                );
+            }
+            self.machine.mark_request_as_sent(&txn_id, &resp).await?;
+        }
+
+        // Process any other pending outgoing requests (key uploads, etc.).
+        self.process_outgoing_requests().await?;
 
         // Step 3: Claim missing Olm sessions for room members.
         self.claim_missing_sessions(room_members).await?;
@@ -304,8 +366,28 @@ impl CryptoManager {
             )
             .await?;
 
-        for request in requests {
-            let resp = self.matrix_client.send_to_device_raw(&request).await?;
+        info!(
+            room_id = %room_id,
+            to_device_requests = requests.len(),
+            "encrypt: sharing room key"
+        );
+
+        for request in &requests {
+            // Log which users/devices we're sending keys to.
+            let recipient_count: usize = request.messages.values()
+                .map(|devices| devices.len())
+                .sum();
+            let recipients: Vec<String> = request.messages.keys()
+                .map(|u| u.to_string())
+                .collect();
+            info!(
+                room_id = %room_id,
+                event_type = %request.event_type,
+                recipients = recipient_count,
+                recipient_users = ?recipients,
+                "encrypt: sending to-device key share"
+            );
+            let resp = self.matrix_client.send_to_device_raw(request).await?;
             self.machine
                 .mark_request_as_sent(&request.txn_id, &resp)
                 .await?;
@@ -324,6 +406,17 @@ impl CryptoManager {
         self.process_outgoing_requests().await?;
 
         let encrypted_value: Value = serde_json::from_str(encrypted.json().get())?;
+
+        // Log key fields from encrypted content for debugging.
+        info!(
+            room_id = %room_id,
+            session_id = encrypted_value.get("session_id").and_then(|v| v.as_str()).unwrap_or("?"),
+            has_sender_key = encrypted_value.get("sender_key").is_some(),
+            has_device_id = encrypted_value.get("device_id").is_some(),
+            algorithm = encrypted_value.get("algorithm").and_then(|v| v.as_str()).unwrap_or("?"),
+            "encrypt: message encrypted successfully"
+        );
+
         Ok(encrypted_value)
     }
 

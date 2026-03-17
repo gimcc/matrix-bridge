@@ -61,9 +61,19 @@ impl MatrixClient {
     }
 
     /// Convert a reqwest Response into an http::Response<Vec<u8>> for ruma deserialization.
+    ///
+    /// Logs a warning for non-2xx responses to aid E2EE debugging.
     async fn to_http_response(resp: reqwest::Response) -> anyhow::Result<http::Response<Vec<u8>>> {
         let status = resp.status();
         let bytes = resp.bytes().await?;
+        if !status.is_success() {
+            let body_preview = String::from_utf8_lossy(&bytes);
+            warn!(
+                status = %status,
+                body = %body_preview,
+                "homeserver returned non-2xx for crypto request"
+            );
+        }
         let http_resp = http::Response::builder()
             .status(status)
             .body(bytes.to_vec())?;
