@@ -187,6 +187,96 @@ fn default_events() -> String {
     "message".to_string()
 }
 
+/// Validate that a webhook URL uses an allowed scheme.
+/// When `ssrf_protection` is enabled, also blocks localhost, cloud metadata
+/// endpoints, and private/reserved IP ranges (RFC1918, link-local, CGNAT, etc.).
+/// DNS names are resolved to catch rebinding attacks (e.g., `127.0.0.1.nip.io`).
+fn validate_webhook_url(url: &str, ssrf_protection: bool) -> Result<(), String> {
+    let parsed: url::Url = url.parse().map_err(|e| format!("invalid URL: {e}"))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("unsupported scheme: {other}")),
+    }
+
+    if !ssrf_protection {
+        return Ok(());
+    }
+
+    let host = parsed.host_str().ok_or("missing host")?;
+
+    // Block well-known dangerous hostnames.
+    let blocked_hosts = ["localhost", "metadata.google.internal"];
+    if blocked_hosts.contains(&host) {
+        return Err(format!("blocked host: {host}"));
+    }
+
+    // Parse as IP and block private/reserved ranges.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && is_private_ip(ip)
+    {
+        return Err(format!("blocked private/reserved IP: {ip}"));
+    }
+    // Also try stripping brackets for IPv6 (e.g., "[::1]").
+    let stripped = host.trim_start_matches('[').trim_end_matches(']');
+    if stripped != host
+        && let Ok(ip) = stripped.parse::<std::net::IpAddr>()
+        && is_private_ip(ip)
+    {
+        return Err(format!("blocked private/reserved IP: {ip}"));
+    }
+
+    // Resolve DNS names to catch rebinding attacks (e.g., 127.0.0.1.nip.io).
+    // Only check if the host is not already a raw IP address.
+    if host.parse::<std::net::IpAddr>().is_err() && stripped.parse::<std::net::IpAddr>().is_err() {
+        let port = parsed
+            .port()
+            .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+        let authority = format!("{host}:{port}");
+        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&authority) {
+            for addr in addrs {
+                if is_private_ip(addr.ip()) {
+                    return Err(format!(
+                        "host {host} resolves to blocked private/reserved IP: {}",
+                        addr.ip()
+                    ));
+                }
+            }
+        }
+        // If DNS resolution fails, the webhook will fail at delivery time anyway.
+    }
+
+    Ok(())
+}
+
+/// Check if an IP address belongs to a private, loopback, link-local,
+/// or otherwise reserved range that should not be reachable via webhooks.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()          // 127.0.0.0/8
+            || v4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local()     // 169.254.0.0/16
+            || v4.is_unspecified()    // 0.0.0.0
+            || v4.is_broadcast()      // 255.255.255.255
+            || v4.is_documentation()  // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback()          // ::1
+            || v6.is_unspecified()    // ::
+            || (seg[0] & 0xfe00) == 0xfc00  // fc00::/7 (unique local address)
+            || (seg[0] & 0xffc0) == 0xfe80  // fe80::/10 (link-local)
+            // Check for IPv4-mapped IPv6 (::ffff:x.x.x.x).
+            || match v6.to_ipv4_mapped() {
+                Some(v4) => is_private_ip(std::net::IpAddr::V4(v4)),
+                None => false,
+            }
+        }
+    }
+}
+
 /// Build the bridge API router.
 /// These routes are for external platform services to interact with the bridge.
 pub fn build_bridge_api_router() -> Router<Arc<AppState>> {
@@ -413,6 +503,12 @@ async fn handle_create_webhook(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateWebhookRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = validate_webhook_url(&req.url, state.webhook_ssrf_protection) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid webhook URL: {e}") })),
+        );
+    }
     let exclude_sources = req.exclude_sources.join(",");
     let dispatcher = state.dispatcher.lock().await;
     match dispatcher
@@ -531,6 +627,8 @@ async fn handle_upload(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
+    const MAX_UPLOAD_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+
     let data = match field.bytes().await {
         Ok(b) => b.to_vec(),
         Err(e) => {
@@ -542,6 +640,14 @@ async fn handle_upload(
     };
 
     let size = data.len();
+    if size > MAX_UPLOAD_SIZE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(
+                json!({ "error": format!("file too large: {size} bytes (max {MAX_UPLOAD_SIZE})") }),
+            ),
+        );
+    }
 
     let dispatcher = state.dispatcher.lock().await;
     match dispatcher

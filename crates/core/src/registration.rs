@@ -128,6 +128,8 @@ mod tests {
             as_token: "as_token_123".to_string(),
             hs_token: "hs_token_456".to_string(),
             puppet_prefix: "bot".to_string(),
+            api_key: None,
+            webhook_ssrf_protection: false,
         };
 
         let reg = build_registration(

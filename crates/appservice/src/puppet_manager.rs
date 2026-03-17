@@ -1,8 +1,6 @@
 use dashmap::DashMap;
 use tracing::info;
 
-use matrix_bridge_core::message::ExternalUser;
-use matrix_bridge_core::platform::{self, BridgePlatform};
 use matrix_bridge_store::Database;
 
 use crate::matrix_client::MatrixClient;
@@ -15,113 +13,20 @@ use crate::matrix_client::MatrixClient;
 pub struct PuppetManager {
     matrix_client: MatrixClient,
     db: Database,
-    _server_name: String,
-    puppet_prefix: String,
     /// In-memory cache of already-ensured puppet user IDs.
     cache: DashMap<String, String>,
 }
 
 impl PuppetManager {
-    pub fn new(
-        matrix_client: MatrixClient,
-        db: Database,
-        server_name: &str,
-        puppet_prefix: &str,
-    ) -> Self {
+    pub fn new(matrix_client: MatrixClient, db: Database) -> Self {
         Self {
             matrix_client,
             db,
-            _server_name: server_name.to_string(),
-            puppet_prefix: puppet_prefix.to_string(),
             cache: DashMap::new(),
         }
     }
 
-    /// Ensure a puppet user exists for the given external user.
-    /// Returns the Matrix user ID (e.g., `@bot_telegram_12345:example.com`).
-    pub async fn ensure_puppet(
-        &self,
-        platform: &dyn BridgePlatform,
-        user: &ExternalUser,
-    ) -> anyhow::Result<String> {
-        let localpart =
-            platform::puppet_localpart(&self.puppet_prefix, platform.id(), &user.external_id);
-        let cache_key = format!("{}:{}", user.platform, user.external_id);
-
-        // Check in-memory cache first.
-        if let Some(user_id) = self.cache.get(&cache_key) {
-            return Ok(user_id.clone());
-        }
-
-        // Check database.
-        let existing = self
-            .db
-            .find_puppet_by_external_id(&user.platform, &user.external_id)
-            .await?;
-
-        let matrix_user_id = if let Some(puppet) = existing {
-            // Update display name / avatar if changed.
-            let name_changed = user.display_name.as_deref() != puppet.display_name.as_deref();
-            let avatar_changed = user.avatar_url.as_deref() != puppet.avatar_mxc.as_deref();
-
-            if name_changed && let Some(name) = &user.display_name {
-                self.matrix_client
-                    .set_display_name(&puppet.matrix_user_id, name)
-                    .await?;
-            }
-            if avatar_changed && let Some(url) = &user.avatar_url {
-                self.matrix_client
-                    .set_avatar(&puppet.matrix_user_id, url)
-                    .await?;
-            }
-            if name_changed || avatar_changed {
-                self.db
-                    .upsert_puppet(
-                        &puppet.matrix_user_id,
-                        &user.platform,
-                        &user.external_id,
-                        user.display_name.as_deref(),
-                        user.avatar_url.as_deref(),
-                    )
-                    .await?;
-            }
-
-            puppet.matrix_user_id
-        } else {
-            // Register new puppet.
-            let user_id = self.matrix_client.register_puppet(&localpart).await?;
-            info!(
-                platform = user.platform,
-                external_id = user.external_id,
-                matrix_user_id = user_id,
-                "registered new puppet"
-            );
-
-            if let Some(name) = &user.display_name {
-                self.matrix_client.set_display_name(&user_id, name).await?;
-            }
-            if let Some(url) = &user.avatar_url {
-                self.matrix_client.set_avatar(&user_id, url).await?;
-            }
-
-            self.db
-                .upsert_puppet(
-                    &user_id,
-                    &user.platform,
-                    &user.external_id,
-                    user.display_name.as_deref(),
-                    user.avatar_url.as_deref(),
-                )
-                .await?;
-
-            user_id
-        };
-
-        self.cache.insert(cache_key, matrix_user_id.clone());
-        Ok(matrix_user_id)
-    }
-
-    /// Ensure a puppet user exists without requiring a BridgePlatform reference.
+    /// Ensure a puppet user exists.
     /// Used by the HTTP bridge API where the localpart is computed by the caller.
     pub async fn ensure_puppet_direct(
         &self,

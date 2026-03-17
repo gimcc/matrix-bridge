@@ -96,6 +96,24 @@ pub struct AppserviceConfig {
     /// Default: `"bot"` → `@bot_telegram_12345:domain`.
     #[serde(default = "default_puppet_prefix")]
     pub puppet_prefix: String,
+    /// Optional API key for the Bridge HTTP API (`/api/v1/*` routes).
+    /// When set, every Bridge API request must include this key via
+    /// `Authorization: Bearer <api_key>` header or `access_token` query param.
+    /// When empty (default), the Bridge API requires no authentication —
+    /// suitable for internal/trusted-network deployments where access control
+    /// is handled by a reverse proxy or network-level middleware.
+    ///
+    /// This is intentionally separate from `hs_token` (which is a Matrix
+    /// protocol secret between the homeserver and the appservice).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Block webhook URLs targeting private/reserved IP ranges (SSRF protection).
+    /// When `true`, webhook registration rejects targets on loopback, RFC1918,
+    /// link-local, CGNAT, and other non-routable addresses.
+    /// Default: `false` (allow private IPs — suitable for internal deployments
+    /// where webhook targets are on the same private network).
+    #[serde(default)]
+    pub webhook_ssrf_protection: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

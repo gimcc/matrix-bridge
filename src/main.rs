@@ -53,12 +53,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Create puppet manager.
-    let puppet_manager = Arc::new(PuppetManager::new(
-        matrix_client.clone(),
-        db.clone(),
-        &config.homeserver.domain,
-        &config.appservice.puppet_prefix,
-    ));
+    let puppet_manager = Arc::new(PuppetManager::new(matrix_client.clone(), db.clone()));
 
     // Generate registration YAML if requested.
     if std::env::args().any(|a| a == "--generate-registration") {
@@ -157,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         dispatcher: Arc::new(Mutex::new(dispatcher)),
         processed_txns: Mutex::new(indexmap::IndexSet::new()),
         crypto_manager,
+        webhook_ssrf_protection: config.appservice.webhook_ssrf_protection,
     });
 
     // Start HTTP server.
@@ -171,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
         &config.appservice.address,
         config.appservice.port,
         config.appservice.hs_token.clone(),
+        config.appservice.api_key.clone(),
     )
     .await?;
 

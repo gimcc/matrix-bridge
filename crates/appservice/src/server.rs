@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
-use crate::auth::{HsToken, verify_hs_token};
+use crate::auth::{ApiKey, HsToken, verify_api_key, verify_hs_token};
 use crate::bridge_api;
 use crate::crypto_manager::CryptoManager;
 use crate::dispatcher::Dispatcher;
@@ -29,11 +29,20 @@ pub struct AppState {
     pub processed_txns: Mutex<IndexSet<String>>,
     /// Optional crypto manager for E2BE (end-to-bridge encryption).
     pub crypto_manager: Option<Arc<CryptoManager>>,
+    /// Whether to block webhook URLs targeting private/reserved IPs.
+    pub webhook_ssrf_protection: bool,
 }
 
 /// Build the axum Router for the appservice HTTP endpoints.
-pub fn build_router(state: Arc<AppState>, hs_token: String) -> Router {
-    // Matrix appservice endpoints (require hs_token auth).
+///
+/// - `hs_token`: Matrix protocol shared secret (Synapse ↔ appservice). Always
+///   required on `/_matrix/app/v1/*` routes.
+/// - `api_key`: optional API key for the Bridge HTTP API (`/api/v1/*`). When
+///   `Some`, every Bridge API request must carry this key. When `None`, the
+///   Bridge API is unauthenticated — suitable for internal/trusted-network
+///   deployments where access control is handled externally.
+pub fn build_router(state: Arc<AppState>, hs_token: String, api_key: Option<String>) -> Router {
+    // Matrix appservice endpoints (always require hs_token auth).
     let matrix_routes = Router::new()
         .route(
             "/_matrix/app/v1/transactions/{txnId}",
@@ -45,7 +54,16 @@ pub fn build_router(state: Arc<AppState>, hs_token: String) -> Router {
         .layer(Extension(HsToken(hs_token)));
 
     // Bridge HTTP API endpoints (for external platform services).
-    let bridge_routes = bridge_api::build_bridge_api_router();
+    // Authentication is separate from hs_token — uses an independent api_key.
+    // Normalize empty string to None so `api_key = ""` behaves as unauthenticated.
+    let api_key = api_key.filter(|k| !k.is_empty());
+    let bridge_routes = if let Some(key) = api_key {
+        bridge_api::build_bridge_api_router()
+            .layer(middleware::from_fn(verify_api_key))
+            .layer(Extension(ApiKey(key)))
+    } else {
+        bridge_api::build_bridge_api_router()
+    };
 
     // Merge all routes under one state.
     matrix_routes
@@ -177,8 +195,9 @@ pub async fn run_server(
     address: &str,
     port: u16,
     hs_token: String,
+    api_key: Option<String>,
 ) -> anyhow::Result<()> {
-    let app = build_router(state, hs_token);
+    let app = build_router(state, hs_token, api_key);
     let bind_addr = format!("{address}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(bind_addr, "appservice HTTP server listening");

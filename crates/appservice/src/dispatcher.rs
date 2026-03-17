@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -7,7 +6,7 @@ use tracing::{debug, error, info, warn};
 use matrix_bridge_core::config::PermissionsConfig;
 use matrix_bridge_core::error::BridgeError;
 use matrix_bridge_core::message::{BridgeMessage, ExternalRoom, ExternalUser, MessageContent};
-use matrix_bridge_core::platform::{self, BridgePlatform};
+use matrix_bridge_core::platform;
 use matrix_bridge_store::Database;
 
 use crate::crypto_manager::CryptoManager;
@@ -17,19 +16,21 @@ use crate::puppet_manager::PuppetManager;
 /// Routes events between Matrix and external platforms.
 ///
 /// - Matrix -> Platform: Receives Matrix room events, looks up the room mapping,
-///   and forwards to the appropriate platform plugin.
-/// - Platform -> Matrix: Receives BridgeMessages from platform plugins,
+///   and forwards to registered webhooks for each platform.
+/// - Platform -> Matrix: Receives BridgeMessages from the HTTP bridge API,
 ///   ensures puppets exist, and sends messages to Matrix rooms.
 pub struct Dispatcher {
-    platforms: HashMap<String, Arc<dyn BridgePlatform>>,
     puppet_manager: Arc<PuppetManager>,
     matrix_client: MatrixClient,
     db: Database,
-    _server_name: String,
     /// The bridge bot's full Matrix user ID (e.g. `@bridge_bot:example.com`).
     bot_user_id: String,
-    /// Prefix for puppet user localparts (e.g. `"bot"` → `@bot_telegram_12345:domain`).
+    /// Prefix for puppet user localparts (e.g. `"bot"`).
     puppet_prefix: String,
+    /// Precomputed `"@{puppet_prefix}_"` for fast starts_with checks.
+    puppet_user_prefix: String,
+    /// Shared HTTP client for webhook delivery (reuses connection pool).
+    http_client: reqwest::Client,
     /// Optional crypto manager for encrypting outbound messages.
     crypto: Option<Arc<CryptoManager>>,
     /// Whether to auto-enable encryption for rooms on link.
@@ -48,14 +49,20 @@ impl Dispatcher {
         puppet_prefix: &str,
         permissions: PermissionsConfig,
     ) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+
         Self {
-            platforms: HashMap::new(),
             puppet_manager,
             matrix_client,
             db,
-            _server_name: server_name.to_string(),
             bot_user_id: format!("@{sender_localpart}:{server_name}"),
             puppet_prefix: puppet_prefix.to_string(),
+            puppet_user_prefix: format!("@{puppet_prefix}_"),
+            http_client,
             crypto: None,
             encryption_default: false,
             permissions,
@@ -66,13 +73,6 @@ impl Dispatcher {
     pub fn set_crypto(&mut self, crypto: Arc<CryptoManager>, encryption_default: bool) {
         self.crypto = Some(crypto);
         self.encryption_default = encryption_default;
-    }
-
-    /// Register a platform plugin.
-    pub fn register_platform(&mut self, platform: Arc<dyn BridgePlatform>) {
-        let id = platform.id().to_string();
-        info!(platform = id, "registered platform");
-        self.platforms.insert(id, platform);
     }
 
     /// Handle a batch of events from the homeserver transaction endpoint.
@@ -133,15 +133,6 @@ impl Dispatcher {
 
     /// Handle m.room.member events — auto-accept invites for the bridge bot
     /// and puppet users.
-    ///
-    /// When the bridge bot is invited to a room, it automatically joins.
-    /// This is essential because:
-    /// 1. The bot must be IN the room to receive events (messages, encryption state).
-    /// 2. E2EE requires the bot to be a member for Megolm key sharing.
-    /// 3. The `!bridge link` command can only be processed if the bot is in the room.
-    ///
-    /// For puppet users, auto-accept ensures they can send messages on behalf
-    /// of external platform users.
     async fn handle_membership(
         &self,
         room_id: &str,
@@ -163,18 +154,14 @@ impl Dispatcher {
             return Ok(());
         }
 
-        // Check if the invited user is the bridge bot or a puppet user.
         let is_bot = state_key == self.bot_user_id;
-        let is_puppet = state_key.starts_with(&format!("@{}_", self.puppet_prefix));
+        let is_puppet = state_key.starts_with(&self.puppet_user_prefix);
 
         if !is_bot && !is_puppet {
             return Ok(());
         }
 
-        // Check invite whitelist for both bot and puppet invites.
-        // The bridge bot itself is always allowed (it invites puppets internally).
         let inviter = event.get("sender").and_then(|v| v.as_str()).unwrap_or("");
-
         let is_bridge_bot_inviting = inviter == self.bot_user_id;
         if !is_bridge_bot_inviting && !self.permissions.is_invite_allowed(inviter) {
             let target = if is_bot { "bot" } else { "puppet" };
@@ -185,7 +172,6 @@ impl Dispatcher {
             return Ok(());
         }
 
-        // Auto-accept the invite.
         info!(
             room_id,
             invited_user = state_key,
@@ -202,7 +188,6 @@ impl Dispatcher {
             return Ok(());
         }
 
-        // If the bridge bot just joined an encrypted room, track device keys.
         if is_bot && let Some(crypto) = crypto {
             let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
             if let Ok(ruma_room_id) = ruma_room_id
@@ -231,7 +216,6 @@ impl Dispatcher {
 
         let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
 
-        // Ensure we have tracked all room members' devices before decrypting.
         if let Err(e) = self.update_tracked_users(room_id, crypto).await {
             warn!(
                 room_id,
@@ -253,7 +237,6 @@ impl Dispatcher {
 
         match decrypted.event_type.as_str() {
             "m.room.message" => {
-                // Reconstruct a pseudo-event with the decrypted content.
                 let mut pseudo_event = event.clone();
                 pseudo_event["type"] = "m.room.message".into();
                 pseudo_event["content"] = decrypted.content;
@@ -271,10 +254,6 @@ impl Dispatcher {
     }
 
     /// Handle an m.room.message event from Matrix -> external platform.
-    ///
-    /// Queries the database for all room mappings of this Matrix room,
-    /// then delivers to registered webhooks for each platform.
-    /// Does not depend on `self.platforms` — works with dynamically-created mappings.
     async fn handle_room_message(
         &self,
         room_id: &str,
@@ -289,20 +268,16 @@ impl Dispatcher {
         let body = content.get("body").and_then(|v| v.as_str()).unwrap_or("");
         let event_id = event.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Check for management commands.
         if body.starts_with("!bridge") {
             return self.handle_command(room_id, sender, body).await;
         }
 
-        // Find all platforms that have a mapping for this room.
         let mappings = self.db.find_all_mappings_by_matrix_id(room_id).await?;
         if mappings.is_empty() {
             return Ok(());
         }
 
-        // Check if the sender is allowed to have messages forwarded externally.
-        // Puppet users (bridge-internal) skip this check — they relay external messages.
-        let is_puppet_sender = sender.starts_with(&format!("@{}_", self.puppet_prefix));
+        let is_puppet_sender = sender.starts_with(&self.puppet_user_prefix);
         if !is_puppet_sender && !self.permissions.is_invite_allowed(sender) {
             debug!(
                 sender,
@@ -311,92 +286,9 @@ impl Dispatcher {
             return Ok(());
         }
 
-        let message_content = match msgtype {
-            "m.text" => {
-                let formatted = content
-                    .get("formatted_body")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                MessageContent::Text {
-                    body: body.to_string(),
-                    formatted_body: formatted,
-                }
-            }
-            "m.notice" => MessageContent::Notice {
-                body: body.to_string(),
-            },
-            "m.emote" => MessageContent::Emote {
-                body: body.to_string(),
-            },
-            "m.image" => {
-                let url = content
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let mimetype = content
-                    .get("info")
-                    .and_then(|i| i.get("mimetype"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("image/png")
-                    .to_string();
-                MessageContent::Image {
-                    url,
-                    caption: Some(body.to_string()).filter(|s| !s.is_empty()),
-                    mimetype,
-                }
-            }
-            "m.file" => {
-                let url = content
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let mimetype = content
-                    .get("info")
-                    .and_then(|i| i.get("mimetype"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                MessageContent::File {
-                    url,
-                    filename: body.to_string(),
-                    mimetype,
-                }
-            }
-            "m.video" => {
-                let url = content
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let mimetype = content
-                    .get("info")
-                    .and_then(|i| i.get("mimetype"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("video/mp4")
-                    .to_string();
-                MessageContent::Video {
-                    url,
-                    caption: Some(body.to_string()).filter(|s| !s.is_empty()),
-                    mimetype,
-                }
-            }
-            "m.audio" => {
-                let url = content
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let mimetype = content
-                    .get("info")
-                    .and_then(|i| i.get("mimetype"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("audio/ogg")
-                    .to_string();
-                MessageContent::Audio { url, mimetype }
-            }
-            _ => {
+        let message_content = match Self::parse_message_content(msgtype, body, &content) {
+            Some(c) => c,
+            None => {
                 debug!(msgtype, "unsupported message type, skipping outbound");
                 return Ok(());
             }
@@ -407,8 +299,6 @@ impl Dispatcher {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        // Look up puppet from DB first (authoritative platform_id), then
-        // fall back to string-based extraction for unregistered puppets.
         let puppet_record = self
             .db
             .find_puppet_by_matrix_id(sender)
@@ -429,10 +319,7 @@ impl Dispatcher {
             );
         }
 
-        let original_sender = puppet_record;
-
         for mapping in &mappings {
-            // Skip forwarding back to the puppet's source platform (loop prevention).
             if let Some(ref src) = source_platform
                 && mapping.platform_id == *src
             {
@@ -443,7 +330,7 @@ impl Dispatcher {
                 continue;
             }
 
-            let bridge_sender = if let Some(ref puppet) = original_sender {
+            let bridge_sender = if let Some(ref puppet) = puppet_record {
                 ExternalUser {
                     platform: puppet.platform_id.clone(),
                     external_id: puppet.external_user_id.clone(),
@@ -472,7 +359,6 @@ impl Dispatcher {
                 reply_to: None,
             };
 
-            // Deliver to all webhooks for this platform.
             match self
                 .deliver_to_webhooks(
                     &mapping.platform_id,
@@ -507,10 +393,88 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Parse a Matrix message content JSON into a `MessageContent`.
+    fn parse_message_content(msgtype: &str, body: &str, content: &Value) -> Option<MessageContent> {
+        match msgtype {
+            "m.text" => {
+                let formatted = content
+                    .get("formatted_body")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Some(MessageContent::Text {
+                    body: body.to_string(),
+                    formatted_body: formatted,
+                })
+            }
+            "m.notice" => Some(MessageContent::Notice {
+                body: body.to_string(),
+            }),
+            "m.emote" => Some(MessageContent::Emote {
+                body: body.to_string(),
+            }),
+            "m.image" => Some(Self::parse_media_content(content, body, "image/png", true)),
+            "m.file" => {
+                let url = Self::extract_url(content);
+                let mimetype = Self::extract_mimetype(content, "application/octet-stream");
+                Some(MessageContent::File {
+                    url,
+                    filename: body.to_string(),
+                    mimetype,
+                })
+            }
+            "m.video" => Some(Self::parse_media_content(content, body, "video/mp4", true)),
+            "m.audio" => {
+                let url = Self::extract_url(content);
+                let mimetype = Self::extract_mimetype(content, "audio/ogg");
+                Some(MessageContent::Audio { url, mimetype })
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_media_content(
+        content: &Value,
+        body: &str,
+        default_mime: &str,
+        is_visual: bool,
+    ) -> MessageContent {
+        let url = Self::extract_url(content);
+        let mimetype = Self::extract_mimetype(content, default_mime);
+        let caption = Some(body.to_string()).filter(|s| !s.is_empty());
+
+        if is_visual && default_mime.starts_with("video") {
+            MessageContent::Video {
+                url,
+                caption,
+                mimetype,
+            }
+        } else {
+            MessageContent::Image {
+                url,
+                caption,
+                mimetype,
+            }
+        }
+    }
+
+    fn extract_url(content: &Value) -> String {
+        content
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn extract_mimetype(content: &Value, default: &str) -> String {
+        content
+            .get("info")
+            .and_then(|i| i.get("mimetype"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    }
+
     /// Deliver a message to all registered webhooks for a platform.
-    ///
-    /// `source_platform` is the originating platform (if any) — used to check
-    /// per-webhook `exclude_sources` filters.
     async fn deliver_to_webhooks(
         &self,
         platform_id: &str,
@@ -528,19 +492,11 @@ impl Dispatcher {
             "platform": platform_id,
             "message": message,
         });
-        // Include the originating platform so the receiver can tell where
-        // the message came from (e.g. "telegram" when forwarding to Slack).
         if let Some(src) = source_platform {
             payload["source_platform"] = serde_json::Value::String(src.to_string());
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?;
-
         for webhook in &webhooks {
-            // Check per-webhook source exclusion filter.
             if let Some(src) = source_platform
                 && webhook.is_source_excluded(src)
             {
@@ -552,7 +508,8 @@ impl Dispatcher {
                 );
                 continue;
             }
-            match client
+            match self
+                .http_client
                 .post(&webhook.webhook_url)
                 .json(&payload)
                 .send()
@@ -646,32 +603,21 @@ impl Dispatcher {
     }
 
     /// Ensure a puppet user can access a Matrix room.
-    ///
-    /// Always goes through the bridge bot invite flow to prevent accepting
-    /// pending invites from non-whitelisted users:
-    /// 1. Ensure the bridge bot is in the room.
-    /// 2. Bridge bot invites the puppet.
-    /// 3. Puppet joins after invite.
-    ///
-    /// If the puppet is already a member, the invite and join are harmless no-ops.
     async fn ensure_room_access(
         &self,
         room_id: &str,
         puppet_user_id: &str,
     ) -> Result<(), BridgeError> {
-        // Ensure bridge bot is in the room first.
         self.matrix_client
             .join_room(room_id, &self.bot_user_id)
             .await
             .map_err(|e| BridgeError::Matrix(format!("bridge bot join failed: {e}")))?;
 
-        // Bridge bot invites puppet (no-op if already a member).
         self.matrix_client
             .invite_user(room_id, puppet_user_id)
             .await
             .map_err(|e| BridgeError::Matrix(format!("invite puppet failed: {e}")))?;
 
-        // Puppet joins after invite.
         self.matrix_client
             .join_room(room_id, puppet_user_id)
             .await
@@ -680,70 +626,8 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Handle an incoming message from an external platform -> Matrix.
-    pub async fn handle_incoming(&self, message: BridgeMessage) -> Result<(), BridgeError> {
-        let platform_id = &message.room.platform;
-        let platform = self
-            .platforms
-            .get(platform_id)
-            .ok_or_else(|| BridgeError::NotFound(format!("platform {platform_id}")))?;
-
-        // Find the Matrix room for this external room.
-        let room_mapping = self
-            .db
-            .find_room_by_external_id(platform_id, &message.room.external_id)
-            .await
-            .map_err(|e| BridgeError::Store(e.to_string()))?;
-
-        let Some(room_mapping) = room_mapping else {
-            debug!(
-                platform = platform_id,
-                external_room = message.room.external_id,
-                "no room mapping found, ignoring message"
-            );
-            return Ok(());
-        };
-
-        // Ensure puppet user exists.
-        let puppet_user_id = self
-            .puppet_manager
-            .ensure_puppet(platform.as_ref(), &message.sender)
-            .await
-            .map_err(|e| BridgeError::Matrix(e.to_string()))?;
-
-        // Ensure puppet can access the room (join, or invite+join).
-        self.ensure_room_access(&room_mapping.matrix_room_id, &puppet_user_id)
-            .await?;
-
-        // Convert message content to Matrix format and send (with encryption if room is encrypted).
-        let (content, txn_id) = self.to_matrix_content(&message);
-
-        let event_id = self
-            .send_to_matrix(
-                &room_mapping.matrix_room_id,
-                &content,
-                &puppet_user_id,
-                &txn_id,
-            )
-            .await
-            .map_err(|e| BridgeError::Matrix(e.to_string()))?;
-
-        // Record the message mapping.
-        self.db
-            .create_message_mapping(&event_id, platform_id, &message.id, room_mapping.id)
-            .await
-            .map_err(|e| BridgeError::Store(e.to_string()))?;
-
-        debug!(
-            event_id,
-            platform = platform_id,
-            "message bridged to matrix"
-        );
-        Ok(())
-    }
-
     /// Convert a BridgeMessage to Matrix message content JSON.
-    fn to_matrix_content(&self, message: &BridgeMessage) -> (Value, String) {
+    fn to_matrix_content(message: &BridgeMessage) -> (Value, String) {
         let txn_id = ulid::Ulid::new().to_string();
 
         let content = match &message.content {
@@ -832,8 +716,7 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Query device keys for all members of a room so the crypto manager
-    /// can track their devices and receive Megolm session keys.
+    /// Query device keys for all members of a room.
     async fn update_tracked_users(
         &self,
         room_id: &str,
@@ -859,7 +742,6 @@ impl Dispatcher {
         if let Some(crypto) = &self.crypto {
             let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
             if crypto.is_room_encrypted(ruma_room_id).await {
-                // Get room members for key sharing.
                 let members_str = self.matrix_client.get_room_members(room_id).await?;
                 let members: Vec<ruma::OwnedUserId> =
                     members_str.iter().filter_map(|m| m.parse().ok()).collect();
@@ -880,12 +762,10 @@ impl Dispatcher {
     }
 
     /// Handle !bridge management commands.
-    /// Requires the sender to have moderator power level (>= 50) for link/unlink.
     async fn handle_command(&self, room_id: &str, sender: &str, body: &str) -> anyhow::Result<()> {
         let parts: Vec<&str> = body.split_whitespace().collect();
         let subcommand = parts.get(1).copied();
 
-        // link/unlink require moderator power level.
         if matches!(subcommand, Some("link") | Some("unlink")) {
             let power_level = self
                 .matrix_client
@@ -903,7 +783,6 @@ impl Dispatcher {
 
         match subcommand {
             Some("link") => {
-                // !bridge link <platform> <external_room_id>
                 let platform_id = parts.get(2).copied().unwrap_or("");
                 let external_id = parts.get(3).copied().unwrap_or("");
                 if platform_id.is_empty() || external_id.is_empty() {
@@ -914,7 +793,6 @@ impl Dispatcher {
                     .create_room_mapping(room_id, platform_id, external_id)
                     .await?;
 
-                // Ensure the bridge bot is in the room so it receives events.
                 if let Err(e) = self
                     .matrix_client
                     .join_room(room_id, &self.bot_user_id)
@@ -923,15 +801,12 @@ impl Dispatcher {
                     warn!(room_id, "bridge bot failed to join linked room: {e}");
                 }
 
-                // Auto-enable encryption if configured.
                 if self.encryption_default
                     && let Err(e) = self.enable_room_encryption(room_id).await
                 {
                     warn!(room_id, "failed to auto-enable encryption: {e}");
                 }
 
-                // If E2EE is active, query device keys of room members so they
-                // can share Megolm sessions with the bridge bot.
                 if let Some(crypto) = &self.crypto
                     && let Err(e) = self.update_tracked_users(room_id, crypto).await
                 {
@@ -952,12 +827,14 @@ impl Dispatcher {
                 }
             }
             Some("status") => {
-                info!(
-                    "bridge status: {} platforms registered",
-                    self.platforms.len()
-                );
-                for id in self.platforms.keys() {
-                    info!("  platform: {id}");
+                let mappings = self.db.find_all_mappings_by_matrix_id(room_id).await?;
+                info!(room_id, mapping_count = mappings.len(), "bridge status");
+                for m in &mappings {
+                    info!(
+                        platform = m.platform_id,
+                        external_room = m.external_room_id,
+                        "  mapping"
+                    );
                 }
             }
             _ => {
@@ -978,19 +855,12 @@ impl Dispatcher {
     }
 
     /// Handle an incoming message via the HTTP bridge API (external -> Matrix).
-    ///
-    /// Unlike `handle_incoming`, this does not require a registered BridgePlatform.
-    /// It directly creates a puppet user and sends the message to the mapped Matrix room.
-    ///
-    /// If no room mapping exists, automatically creates a portal room (the bridge
-    /// bot is the room creator and is therefore already a member).
     pub async fn handle_incoming_http(
         &self,
         message: BridgeMessage,
     ) -> Result<String, BridgeError> {
         let platform_id = &message.room.platform;
 
-        // Find the Matrix room for this external room, or auto-create a portal room.
         let room_mapping = self
             .db
             .find_room_by_external_id(platform_id, &message.room.external_id)
@@ -1000,8 +870,6 @@ impl Dispatcher {
         let room_mapping = match room_mapping {
             Some(m) => m,
             None => {
-                // Auto-create a portal room. The bridge bot is the creator,
-                // so it is automatically a member — no invite/join needed.
                 let room_name = message
                     .room
                     .name
@@ -1023,15 +891,17 @@ impl Dispatcher {
                         BridgeError::Matrix(format!("portal room creation failed: {e}"))
                     })?;
 
-                // If encryption was enabled, track it in the crypto store.
                 if self.encryption_default
                     && let Some(crypto) = &self.crypto
                     && let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(matrix_room_id.as_str())
+                    && let Err(e) = crypto.set_room_encrypted(ruma_room_id).await
                 {
-                    let _ = crypto.set_room_encrypted(ruma_room_id).await;
+                    warn!(
+                        %matrix_room_id,
+                        "failed to mark portal room as encrypted in crypto store: {e}"
+                    );
                 }
 
-                // Register the room mapping.
                 let id = self
                     .db
                     .create_room_mapping(&matrix_room_id, platform_id, &message.room.external_id)
@@ -1054,8 +924,6 @@ impl Dispatcher {
             }
         };
 
-        // Build puppet localpart from prefix + platform + user ID.
-        // Validate that the localpart only contains allowed Matrix characters.
         let localpart = platform::puppet_localpart(
             &self.puppet_prefix,
             platform_id,
@@ -1078,12 +946,10 @@ impl Dispatcher {
             .await
             .map_err(|e| BridgeError::Matrix(e.to_string()))?;
 
-        // Ensure puppet can access the room (join, or invite+join).
         self.ensure_room_access(&room_mapping.matrix_room_id, &puppet_user_id)
             .await?;
 
-        // Convert and send to Matrix (with encryption if room is encrypted).
-        let (content, txn_id) = self.to_matrix_content(&message);
+        let (content, txn_id) = Self::to_matrix_content(&message);
         let event_id = self
             .send_to_matrix(
                 &room_mapping.matrix_room_id,
@@ -1094,7 +960,6 @@ impl Dispatcher {
             .await
             .map_err(|e| BridgeError::Matrix(e.to_string()))?;
 
-        // Record message mapping.
         self.db
             .create_message_mapping(&event_id, platform_id, &message.id, room_mapping.id)
             .await
@@ -1109,14 +974,12 @@ impl Dispatcher {
     }
 
     /// Check if a sender is the bridge bot itself.
-    /// The bridge bot's own messages should always be ignored.
     fn is_bridge_bot(&self, sender: &str) -> bool {
         sender == self.bot_user_id
     }
 }
 
 /// Validate that a localpart only contains allowed Matrix user ID characters.
-/// Per the Matrix spec, localparts must match `[a-z0-9._\-=/]+`.
 fn is_valid_localpart(localpart: &str) -> bool {
     !localpart.is_empty()
         && localpart
