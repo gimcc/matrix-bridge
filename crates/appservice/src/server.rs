@@ -31,6 +31,12 @@ pub struct AppState {
     pub crypto_manager: Option<Arc<CryptoManager>>,
     /// Whether to block webhook URLs targeting private/reserved IPs.
     pub webhook_ssrf_protection: bool,
+    /// Matrix user IDs to auto-invite when the bridge creates a room.
+    pub auto_invite: Vec<String>,
+    /// Whether to allow the API `invite` field in room creation requests.
+    pub allow_api_invite: bool,
+    /// Whether to auto-enable encryption for newly created rooms.
+    pub encryption_default: bool,
 }
 
 /// Build the axum Router for the appservice HTTP endpoints.
@@ -99,48 +105,71 @@ async fn handle_transaction(
 
     // Process MSC2409 to-device events and MSC3202 device list/OTK data
     // for end-to-bridge encryption.
+    //
+    // IMPORTANT: always call receive_sync_changes on every transaction,
+    // even when to_device_events is empty.  The OTK counts and device-list
+    // changes arrive independently and must be processed to:
+    //   1. Upload new one-time keys when the count drops
+    //   2. Track device-list changes for room members
     if let Some(crypto) = &state.crypto_manager {
+        // Support both unstable (de.sorunome.msc2409) and stable (org.matrix.msc2409) prefixes.
         let to_device_events = body
             .get("de.sorunome.msc2409.to_device")
+            .or_else(|| body.get("org.matrix.msc2409.to_device"))
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
 
-        if !to_device_events.is_empty() {
-            let raw_events = to_device_events
-                .into_iter()
-                .filter_map(|v| {
-                    serde_json::value::to_raw_value(&v)
-                        .ok()
-                        .map(ruma::serde::Raw::from_json)
-                })
-                .collect();
+        let raw_events: Vec<_> = to_device_events
+            .into_iter()
+            .filter_map(|v| {
+                serde_json::value::to_raw_value(&v)
+                    .ok()
+                    .map(ruma::serde::Raw::from_json)
+            })
+            .collect();
 
-            let changed_devices: ruma::api::client::sync::sync_events::DeviceLists = body
-                .get("de.sorunome.msc3202.device_lists")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+        // Support both unstable (de.sorunome.msc3202) and stable (org.matrix.msc3202) prefixes.
+        // Newer Synapse versions use org.matrix.msc3202, older ones use de.sorunome.msc3202.
+        let changed_devices: ruma::api::client::sync::sync_events::DeviceLists = body
+            .get("org.matrix.msc3202.device_lists")
+            .or_else(|| body.get("de.sorunome.msc3202.device_lists"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
-            let otk_counts: BTreeMap<ruma::OneTimeKeyAlgorithm, ruma::UInt> = body
-                .get("de.sorunome.msc3202.device_one_time_keys_count")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+        let otk_counts: BTreeMap<ruma::OneTimeKeyAlgorithm, ruma::UInt> = body
+            .get("org.matrix.msc3202.device_one_time_keys_count")
+            .or_else(|| body.get("de.sorunome.msc3202.device_one_time_keys_count"))
+            // Also handle the typo'd field name some Synapse versions use.
+            .or_else(|| body.get("org.matrix.msc3202.device_one_time_key_counts"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
-            let fallback_keys: Option<Vec<ruma::OneTimeKeyAlgorithm>> = body
-                .get("de.sorunome.msc3202.device_unused_fallback_key_types")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let fallback_keys: Option<Vec<ruma::OneTimeKeyAlgorithm>> = body
+            .get("org.matrix.msc3202.device_unused_fallback_key_types")
+            .or_else(|| body.get("de.sorunome.msc3202.device_unused_fallback_key_types"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-            if let Err(e) = crypto
-                .receive_sync_changes(
-                    raw_events,
-                    &changed_devices,
-                    &otk_counts,
-                    fallback_keys.as_deref(),
-                )
-                .await
-            {
-                error!("failed to process to-device events: {e}");
-            }
+        if !raw_events.is_empty() || !changed_devices.changed.is_empty() || !otk_counts.is_empty()
+        {
+            debug!(
+                to_device = raw_events.len(),
+                device_list_changed = changed_devices.changed.len(),
+                otk_counts = otk_counts.len(),
+                "processing MSC2409/3202 crypto data"
+            );
+        }
+
+        if let Err(e) = crypto
+            .receive_sync_changes(
+                raw_events,
+                &changed_devices,
+                &otk_counts,
+                fallback_keys.as_deref(),
+            )
+            .await
+        {
+            error!("failed to process crypto sync changes: {e}");
         }
     }
 
@@ -189,7 +218,7 @@ async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
-/// Start the appservice HTTP server.
+/// Start the appservice HTTP server with graceful shutdown on SIGTERM/SIGINT.
 pub async fn run_server(
     state: Arc<AppState>,
     address: &str,
@@ -201,6 +230,34 @@ pub async fn run_server(
     let bind_addr = format!("{address}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(bind_addr, "appservice HTTP server listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    info!("server shut down gracefully");
     Ok(())
+}
+
+/// Wait for SIGTERM or SIGINT (Ctrl-C) to trigger graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received SIGINT, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+    }
 }

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -13,10 +14,69 @@ use matrix_bridge_core::config::AppConfig;
 use matrix_bridge_core::registration;
 use matrix_bridge_store::Database;
 
+/// Generate a URL-safe random token (32 bytes, base64).
+fn generate_token() -> String {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).expect("failed to generate random bytes");
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// Write a default config.toml with freshly generated tokens.
+fn write_default_config(path: &str) -> anyhow::Result<()> {
+    let as_token = generate_token();
+    let hs_token = generate_token();
+    let crypto_passphrase = generate_token();
+
+    let content = format!(
+        r#"[homeserver]
+url = "http://matrix:8008"
+domain = "example.com"      # Your Matrix server domain
+
+[appservice]
+id = "matrix-bridge"
+sender_localpart = "bridge_bot"
+as_token = "{as_token}"
+hs_token = "{hs_token}"
+# api_key = ""              # Uncomment to require auth on Bridge API
+# webhook_ssrf_protection = true
+# Matrix users to auto-invite into rooms created by the bridge.
+# auto_invite = ["@admin:example.com"]
+# allow_api_invite = false   # Whether API callers can invite arbitrary users
+
+[database]
+path = "/data/bridge.db"
+
+[logging]
+level = "info"
+
+[encryption]
+allow = true
+default = true
+appservice = true
+crypto_store = "/data/crypto"
+crypto_store_passphrase = "{crypto_passphrase}"
+"#
+    );
+
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, &content)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load config.
+    // Load config — auto-generate a default if the file does not exist.
     let config_path = std::env::var("BRIDGE_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
+
+    if !Path::new(&config_path).exists() {
+        write_default_config(&config_path)?;
+        eprintln!("Generated default config at {config_path} — review and restart.");
+        eprintln!("At minimum, set [homeserver].domain to your Matrix server domain.");
+        return Ok(());
+    }
 
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read config: {config_path}"))?;
@@ -29,6 +89,16 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.logging.level));
 
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
+    // Validate auto_invite entries.
+    for user_id in &config.appservice.auto_invite {
+        if !user_id.starts_with('@') || !user_id.contains(':') {
+            anyhow::bail!(
+                "invalid auto_invite entry '{}': must be a valid Matrix user ID (start with '@' and contain ':')",
+                user_id
+            );
+        }
+    }
 
     info!("starting matrix-bridge");
 
@@ -52,13 +122,81 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Create puppet manager.
-    let puppet_manager = Arc::new(PuppetManager::new(matrix_client.clone(), db.clone()));
+    // Create puppet manager (pass device_id so puppets get the bridge device for MSC4326).
+    let puppet_device_id = if config.encryption.allow {
+        Some(config.encryption.device_id.clone())
+    } else {
+        None
+    };
+    let puppet_manager = Arc::new(PuppetManager::new(
+        matrix_client.clone(),
+        db.clone(),
+        puppet_device_id,
+    ));
 
-    // Generate registration YAML if requested.
-    if std::env::args().any(|a| a == "--generate-registration") {
-        // Use a single regex based on the puppet prefix: @bot_.*:.*
-        // This matches all puppet users regardless of platform.
+    // Manage registration YAML: generate if missing, regenerate if stale,
+    // and verify token consistency.
+    let reg_path =
+        std::env::var("BRIDGE_REGISTRATION").unwrap_or_else(|_| "registration.yaml".to_string());
+    let force_generate = std::env::args().any(|a| a == "--generate-registration");
+
+    let needs_generate = if !Path::new(&reg_path).exists() {
+        true
+    } else if !force_generate {
+        // Check if the existing registration matches the current config.
+        let reg_str = std::fs::read_to_string(&reg_path)
+            .with_context(|| format!("failed to read registration: {reg_path}"))?;
+        let reg_yaml: serde_yaml::Value =
+            serde_yaml::from_str(&reg_str).with_context(|| "failed to parse registration YAML")?;
+
+        let reg_as = reg_yaml.get("as_token").and_then(serde_yaml::Value::as_str);
+        let reg_hs = reg_yaml.get("hs_token").and_then(serde_yaml::Value::as_str);
+
+        // Token mismatch or absence is a fatal error — user must resolve manually.
+        match reg_as {
+            Some(val) if val != config.appservice.as_token => {
+                anyhow::bail!(
+                    "as_token mismatch: config.toml and {reg_path} have different as_token values. \
+                     Update one to match the other, or delete {reg_path} to regenerate."
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "as_token missing in {reg_path}. Delete {reg_path} to regenerate."
+                );
+            }
+            _ => {}
+        }
+        match reg_hs {
+            Some(val) if val != config.appservice.hs_token => {
+                anyhow::bail!(
+                    "hs_token mismatch: config.toml and {reg_path} have different hs_token values. \
+                     Update one to match the other, or delete {reg_path} to regenerate."
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "hs_token missing in {reg_path}. Delete {reg_path} to regenerate."
+                );
+            }
+            _ => {}
+        }
+
+        // Detect encryption config drift: if config enables encryption but
+        // registration is missing MSC fields (or vice versa), regenerate.
+        let has_msc3202 = reg_yaml.get("de.sorunome.msc3202").is_some();
+        let has_push_ephemeral = reg_yaml.get("de.sorunome.msc2409.push_ephemeral").is_some();
+        if config.encryption.allow != has_msc3202 || config.encryption.allow != has_push_ephemeral {
+            info!("encryption config changed, regenerating registration");
+            true
+        } else {
+            false
+        }
+    } else {
+        true // force_generate
+    };
+
+    if needs_generate || force_generate {
         let prefix = &config.appservice.puppet_prefix;
         let user_regexes = vec![format!("@{prefix}_.*:.*")];
 
@@ -69,11 +207,14 @@ async fn main() -> anyhow::Result<()> {
             config.encryption.allow,
         );
         let yaml = registration::to_yaml(&reg)?;
-        let reg_path = std::env::var("BRIDGE_REGISTRATION")
-            .unwrap_or_else(|_| "registration.yaml".to_string());
         std::fs::write(&reg_path, &yaml)?;
-        info!(path = reg_path, "registration YAML written");
-        return Ok(());
+        info!(path = reg_path, "registration YAML generated");
+
+        if force_generate {
+            return Ok(());
+        }
+    } else {
+        info!("registration verified");
     }
 
     // Register the bridge bot user on the homeserver (idempotent).
@@ -122,8 +263,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| "failed to initialize crypto manager")?;
 
-        // Upload initial device keys.
-        cm.process_outgoing_requests().await?;
         info!("end-to-bridge encryption enabled");
 
         Some(Arc::new(cm))
@@ -153,6 +292,9 @@ async fn main() -> anyhow::Result<()> {
         processed_txns: Mutex::new(indexmap::IndexSet::new()),
         crypto_manager,
         webhook_ssrf_protection: config.appservice.webhook_ssrf_protection,
+        auto_invite: config.appservice.auto_invite.clone(),
+        allow_api_invite: config.appservice.allow_api_invite,
+        encryption_default: config.encryption.default,
     });
 
     // Start HTTP server.

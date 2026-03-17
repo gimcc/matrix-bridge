@@ -55,3 +55,6 @@ toml = { workspace = true }
 serde = { workspace = true }
 ruma = { workspace = true }
 indexmap = { workspace = true }
+base64 = "0.22"
+getrandom = "0.2"
+serde_yaml = { workspace = true }

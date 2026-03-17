@@ -28,7 +28,7 @@ All configuration is done through environment variables:
 | `BRIDGE_URL`   | `http://localhost:29320`   | Base URL of the bridge API            |
 | `PLATFORM`     | `myapp`                    | Platform identifier for this app      |
 | `ROOM_ID`      | `general`                  | External room ID to bridge            |
-| `MATRIX_ROOM_ID` | `!changeme:example.com` | Matrix room ID to bridge              |
+| `MATRIX_ROOM_ID` | *(auto-create)*          | Matrix room ID (optional; auto-created if omitted) |
 | `WEBHOOK_PORT` | `5050`                     | Port the demo server listens on       |
 | `WEBHOOK_HOST` | `http://localhost:5050`    | Public URL the bridge can reach       |
 
@@ -67,9 +67,10 @@ Requires Node.js 18+.
 ## Running the Bun chat demo
 
 ```bash
-cd examples/bun-chat
+cd examples/bun
 
-export MATRIX_ROOM_ID='!your_room:example.com'
+# Optional: specify an existing Matrix room
+# export MATRIX_ROOM_ID='!your_room:example.com'
 
 bun run server.ts
 ```
@@ -147,7 +148,14 @@ POST /api/v1/rooms
 ```
 
 ```json
-{ "platform": "myapp", "external_room_id": "general", "matrix_room_id": "!abc:example.com" }
+{ "platform": "myapp", "external_room_id": "general" }
+```
+
+`matrix_room_id` is optional. When omitted the bridge auto-creates a Matrix room.
+The response always includes the `matrix_room_id` that was used:
+
+```json
+{ "id": 1, "matrix_room_id": "!newroom:example.com" }
 ```
 
 ---

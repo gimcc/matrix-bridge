@@ -24,6 +24,14 @@ hs_token = "CHANGE_ME_HS_TOKEN"
 # targets are on the same private network).
 # Set to true when the bridge is exposed to untrusted networks.
 # webhook_ssrf_protection = true
+# Matrix users to auto-invite into rooms created by the bridge.
+# Without this, auto-created rooms are empty (only the bridge bot).
+# auto_invite = ["@admin:im.fr.ds.cc"]
+# Allow the Bridge API `invite` field in room creation requests.
+# When false (default), the `invite` field is silently ignored —
+# only `auto_invite` from config is used. This prevents external
+# services from inviting arbitrary Matrix users.
+# allow_api_invite = false
 
 [database]
 path = "/data/bridge.db"
@@ -45,13 +53,9 @@ crypto_store = "/data/crypto"
 crypto_store_passphrase = "CHANGE_ME_CRYPTO_PASSPHRASE"
 device_display_name = "Matrix Bridge"
 
-# Platform-specific configuration sections.
-# Each platform is enabled by adding its section here.
-# Example:
-#
-# [platforms.telegram]
-# bot_token = "123456:ABC-DEF"
-# username_template = "tg_{userid}"
+# Platform-specific configuration sections (reserved for future built-in bridges).
+# Currently all platforms use the HTTP Bridge API below.
+# [platforms]
 
 # --- HTTP Bridge API -----------------------------------------------
 # External services can bridge with Matrix via HTTP without being
@@ -59,7 +63,11 @@ device_display_name = "Matrix Bridge"
 #
 # 1. Create room mapping:
 #    POST /api/v1/rooms
-#    {"platform":"myapp","external_room_id":"chat_123","matrix_room_id":"!abc:im.fr.ds.cc"}
+#    {"platform":"myapp","external_room_id":"chat_123"}
+#    Optional fields:
+#      "matrix_room_id": "!abc:im.fr.ds.cc"  (auto-creates room if omitted)
+#      "room_name": "My Chat Room"            (name for auto-created rooms)
+#      "invite": ["@alice:im.fr.ds.cc"]       (requires allow_api_invite = true)
 #
 # 2. Register webhook (receive Matrix -> external messages):
 #    POST /api/v1/webhooks

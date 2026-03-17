@@ -12,7 +12,8 @@ use ruma::{
     api::client::sync::sync_events::DeviceLists, events::AnyToDeviceEvent, serde::Raw,
 };
 use serde_json::Value;
-use tracing::{debug, info};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 use matrix_bridge_core::config::EncryptionConfig;
 
@@ -26,15 +27,24 @@ use crate::matrix_client::MatrixClient;
 /// - Device key uploads
 /// - To-device event processing (key exchange via MSC2409)
 /// - Device list tracking (MSC3202)
+///
+/// All crypto operations are serialized through an internal RwLock to prevent
+/// concurrent sync/encrypt conflicts (similar to matrix-bot-sdk's AsyncLock).
 pub struct CryptoManager {
     machine: OlmMachine,
     matrix_client: MatrixClient,
+    /// Serializes sync-level operations (receive_sync_changes, process_outgoing)
+    /// against encrypt-level operations (prepare + encrypt) to prevent races.
+    lock: RwLock<()>,
 }
 
 impl CryptoManager {
     /// Initialize the crypto manager for the bridge bot.
     ///
     /// Creates or loads the OlmMachine from a persistent SQLite crypto store.
+    /// After initialization, verifies that device keys are present on the
+    /// homeserver. If missing (stale crypto store from a previous failed
+    /// startup), the store is rebuilt from scratch.
     pub async fn new(
         user_id: &UserId,
         device_id: &ruma::DeviceId,
@@ -52,8 +62,50 @@ impl CryptoManager {
             );
         }
 
-        let store = SqliteCryptoStore::open(store_path, passphrase).await?;
+        let mut cm = Self::open(user_id, device_id, store_path, passphrase, matrix_client.clone()).await?;
 
+        // Upload any pending keys (fresh store) or process OTK replenishment.
+        cm.process_outgoing_requests().await?;
+
+        // Verify that our device keys are actually on the homeserver.
+        // A restored crypto store may believe keys were uploaded when they
+        // never actually reached the server (e.g. previous startup crashed
+        // before the upload completed).  In that case, wipe the store and
+        // re-create from scratch so a fresh upload is generated.
+        if !cm.device_keys_on_server().await? {
+            warn!("device keys missing on server — rebuilding crypto store");
+            // Drop the machine so the SQLite handle is released.
+            drop(cm);
+            if store_path.exists() {
+                std::fs::remove_dir_all(store_path)?;
+                std::fs::create_dir_all(store_path)?;
+            }
+            cm = Self::open(user_id, device_id, store_path, passphrase, matrix_client).await?;
+            cm.process_outgoing_requests().await?;
+
+            if !cm.device_keys_on_server().await? {
+                anyhow::bail!(
+                    "failed to upload device keys after crypto store rebuild — \
+                     check homeserver connectivity and appservice registration"
+                );
+            }
+            info!("device keys uploaded after crypto store rebuild");
+        } else {
+            debug!("device keys verified on server");
+        }
+
+        Ok(cm)
+    }
+
+    /// Open or create the crypto store and build an OlmMachine.
+    async fn open(
+        user_id: &UserId,
+        device_id: &ruma::DeviceId,
+        store_path: &Path,
+        passphrase: Option<&str>,
+        matrix_client: MatrixClient,
+    ) -> anyhow::Result<Self> {
+        let store = SqliteCryptoStore::open(store_path, passphrase).await?;
         let machine = OlmMachine::with_store(user_id, device_id, store, None).await?;
 
         info!(
@@ -65,7 +117,25 @@ impl CryptoManager {
         Ok(Self {
             machine,
             matrix_client,
+            lock: RwLock::new(()),
         })
+    }
+
+    /// Check whether our device keys are present on the homeserver.
+    async fn device_keys_on_server(&self) -> anyhow::Result<bool> {
+        let user_id = self.machine.user_id().to_owned();
+        let req = matrix_sdk_crypto::types::requests::KeysQueryRequest {
+            device_keys: std::collections::BTreeMap::from([(user_id.clone(), Vec::new())]),
+            timeout: Some(std::time::Duration::from_secs(10)),
+        };
+        let resp = self.matrix_client.query_keys_raw(&req).await?;
+
+        let has_device = resp
+            .device_keys
+            .get(&user_id)
+            .map_or(false, |devices| !devices.is_empty());
+
+        Ok(has_device)
     }
 
     /// Upload device keys and one-time keys to the homeserver.
@@ -76,39 +146,108 @@ impl CryptoManager {
         let outgoing = self.machine.outgoing_requests().await?;
 
         for request in outgoing {
-            match request.request() {
-                AnyOutgoingRequest::KeysUpload(req) => {
-                    let resp = self.matrix_client.upload_keys_raw(req).await?;
-                    self.machine
-                        .mark_request_as_sent(request.request_id(), &resp)
-                        .await?;
-                    debug!("device keys uploaded");
-                }
-                AnyOutgoingRequest::KeysQuery(req) => {
-                    let resp = self.matrix_client.query_keys_raw(req).await?;
-                    self.machine
-                        .mark_request_as_sent(request.request_id(), &resp)
-                        .await?;
-                    debug!("keys query completed");
-                }
-                AnyOutgoingRequest::KeysClaim(req) => {
-                    let resp = self.matrix_client.claim_keys_raw(req).await?;
-                    self.machine
-                        .mark_request_as_sent(request.request_id(), &resp)
-                        .await?;
-                    debug!("keys claimed");
-                }
-                AnyOutgoingRequest::ToDeviceRequest(req) => {
-                    let resp = self.matrix_client.send_to_device_raw(req).await?;
-                    self.machine
-                        .mark_request_as_sent(request.request_id(), &resp)
-                        .await?;
-                    debug!("to-device event sent");
-                }
-                _ => {
-                    debug!("unhandled outgoing request type");
-                }
+            self.dispatch_outgoing_request(request.request_id(), request.request()).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch a single outgoing request to the homeserver and mark it as sent.
+    async fn dispatch_outgoing_request(
+        &self,
+        request_id: &ruma::TransactionId,
+        request: &AnyOutgoingRequest,
+    ) -> anyhow::Result<()> {
+        match request {
+            AnyOutgoingRequest::KeysUpload(req) => {
+                let otk_count = req.one_time_keys.len();
+                let has_device_keys = req.device_keys.is_some();
+                let resp = self.matrix_client.upload_keys_raw(req).await?;
+                info!(
+                    has_device_keys,
+                    otk_count,
+                    otk_counts = ?resp.one_time_key_counts,
+                    "keys uploaded"
+                );
+                self.machine
+                    .mark_request_as_sent(request_id, &resp)
+                    .await?;
             }
+            AnyOutgoingRequest::KeysQuery(req) => {
+                let queried_users: Vec<String> = req.device_keys.keys()
+                    .map(|u| u.to_string())
+                    .collect();
+                info!(users = ?queried_users, "keys query: requesting device keys");
+                let resp = self.matrix_client.query_keys_raw(req).await?;
+                // Log how many devices we got for each user.
+                for (user_id, devices) in &resp.device_keys {
+                    info!(
+                        user_id = %user_id,
+                        device_count = devices.len(),
+                        device_ids = ?devices.keys().map(|d| d.to_string()).collect::<Vec<_>>(),
+                        "keys query: got devices"
+                    );
+                }
+                self.machine
+                    .mark_request_as_sent(request_id, &resp)
+                    .await?;
+            }
+            AnyOutgoingRequest::KeysClaim(req) => {
+                let claim_users: Vec<String> = req.one_time_keys.keys()
+                    .map(|u| u.to_string())
+                    .collect();
+                info!(users = ?claim_users, "keys claim: claiming OTKs");
+                let resp = self.matrix_client.claim_keys_raw(req).await?;
+                for (user_id, devices) in &resp.one_time_keys {
+                    info!(
+                        user_id = %user_id,
+                        device_count = devices.len(),
+                        "keys claim: got OTKs"
+                    );
+                }
+                self.machine
+                    .mark_request_as_sent(request_id, &resp)
+                    .await?;
+            }
+            AnyOutgoingRequest::ToDeviceRequest(req) => {
+                let recipient_count: usize = req.messages.values()
+                    .map(|devices| devices.len())
+                    .sum();
+                debug!(
+                    event_type = %req.event_type,
+                    recipients = recipient_count,
+                    "sending to-device event"
+                );
+                let resp = self.matrix_client.send_to_device_raw(req).await?;
+                self.machine
+                    .mark_request_as_sent(request_id, &resp)
+                    .await?;
+            }
+            _ => {
+                debug!("unhandled outgoing request type");
+            }
+        }
+        Ok(())
+    }
+
+    /// Claim missing Olm sessions for the given users.
+    ///
+    /// Calls `OlmMachine::get_missing_sessions` and if a claim request is
+    /// produced, sends it to the homeserver and marks it as sent.
+    async fn claim_missing_sessions(&self, user_ids: &[OwnedUserId]) -> anyhow::Result<()> {
+        let refs: Vec<&UserId> = user_ids.iter().map(|u| u.as_ref()).collect();
+        let claim_req = self.machine.get_missing_sessions(refs.into_iter()).await?;
+
+        if let Some((txn_id, req)) = claim_req {
+            let claim_users: Vec<String> = req.one_time_keys.keys()
+                .map(|u| u.to_string())
+                .collect();
+            info!(users = ?claim_users, "claiming missing Olm sessions");
+            let resp = self.matrix_client.claim_keys_raw(&req).await?;
+            self.machine.mark_request_as_sent(&txn_id, &resp).await?;
+            info!("claimed missing Olm sessions successfully");
+        } else {
+            debug!("no missing Olm sessions to claim");
         }
 
         Ok(())
@@ -117,6 +256,7 @@ impl CryptoManager {
     /// Process to-device events received via appservice transactions (MSC2409).
     ///
     /// These events contain Olm key exchange messages needed for E2EE.
+    /// Acquires a write lock to prevent concurrent encrypt operations.
     pub async fn receive_sync_changes(
         &self,
         to_device_events: Vec<Raw<AnyToDeviceEvent>>,
@@ -124,6 +264,8 @@ impl CryptoManager {
         one_time_keys_counts: &BTreeMap<OneTimeKeyAlgorithm, UInt>,
         unused_fallback_keys: Option<&[OneTimeKeyAlgorithm]>,
     ) -> anyhow::Result<()> {
+        let _guard = self.lock.write().await;
+
         let decryption_settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
         };
@@ -150,8 +292,15 @@ impl CryptoManager {
 
     /// Encrypt a message for a room.
     ///
+    /// Performs the full preparation flow before encrypting (like matrix-bot-sdk's
+    /// `prepareEncrypt`):
+    /// 1. Update tracked users for all room members
+    /// 2. Process ALL pending outgoing requests (keys query, claim, etc.)
+    /// 3. Claim missing Olm sessions
+    /// 4. Share Megolm room key with all member devices
+    /// 5. Encrypt the event content
+    ///
     /// Returns the encrypted event content as JSON (m.room.encrypted).
-    /// If the room doesn't have an encryption session yet, creates one.
     pub async fn encrypt(
         &self,
         room_id: &RoomId,
@@ -159,8 +308,55 @@ impl CryptoManager {
         content: &Value,
         room_members: &[OwnedUserId],
     ) -> anyhow::Result<Value> {
-        // Ensure we have a Megolm session for this room.
-        // Share room key with all devices of room members.
+        // Hold the write lock through the entire prepare + encrypt flow to
+        // prevent concurrent receive_sync_changes from mutating Olm session
+        // state between preparation and encryption.
+        let _guard = self.lock.write().await;
+
+        info!(
+            room_id = %room_id,
+            member_count = room_members.len(),
+            members = ?room_members.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+            "encrypt: starting preparation"
+        );
+
+        // Step 1: Ensure all room members are tracked.
+        let refs: Vec<&UserId> = room_members.iter().map(|u| u.as_ref()).collect();
+        self.machine.update_tracked_users(refs).await?;
+
+        // Step 2: Force a fresh device key query for all room members.
+        // `update_tracked_users` is a no-op for already-tracked users, so we
+        // use `query_keys_for_users` which always generates a new KeysQuery
+        // regardless of tracking state.  This ensures we have up-to-date
+        // device information even after bridge restarts or missed device-list
+        // change notifications.
+        {
+            let (txn_id, keys_query_req) = self.machine.query_keys_for_users(
+                room_members.iter().map(|u| u.as_ref()),
+            );
+            let queried_users: Vec<String> = keys_query_req.device_keys.keys()
+                .map(|u| u.to_string())
+                .collect();
+            info!(users = ?queried_users, "encrypt: forced keys query for room members");
+            let resp = self.matrix_client.query_keys_raw(&keys_query_req).await?;
+            for (user_id, devices) in &resp.device_keys {
+                info!(
+                    user_id = %user_id,
+                    device_count = devices.len(),
+                    device_ids = ?devices.keys().map(|d| d.to_string()).collect::<Vec<_>>(),
+                    "encrypt: got devices"
+                );
+            }
+            self.machine.mark_request_as_sent(&txn_id, &resp).await?;
+        }
+
+        // Process any other pending outgoing requests (key uploads, etc.).
+        self.process_outgoing_requests().await?;
+
+        // Step 3: Claim missing Olm sessions for room members.
+        self.claim_missing_sessions(room_members).await?;
+
+        // Step 4: Share Megolm room key with all devices of room members.
         let requests = self
             .machine
             .share_room_key(
@@ -170,14 +366,34 @@ impl CryptoManager {
             )
             .await?;
 
-        for request in requests {
-            let resp = self.matrix_client.send_to_device_raw(&request).await?;
+        info!(
+            room_id = %room_id,
+            to_device_requests = requests.len(),
+            "encrypt: sharing room key"
+        );
+
+        for request in &requests {
+            // Log which users/devices we're sending keys to.
+            let recipient_count: usize = request.messages.values()
+                .map(|devices| devices.len())
+                .sum();
+            let recipients: Vec<String> = request.messages.keys()
+                .map(|u| u.to_string())
+                .collect();
+            info!(
+                room_id = %room_id,
+                event_type = %request.event_type,
+                recipients = recipient_count,
+                recipient_users = ?recipients,
+                "encrypt: sending to-device key share"
+            );
+            let resp = self.matrix_client.send_to_device_raw(request).await?;
             self.machine
                 .mark_request_as_sent(&request.txn_id, &resp)
                 .await?;
         }
 
-        // Now encrypt the content.
+        // Step 5: Encrypt the content.
         let raw_content = serde_json::value::to_raw_value(content)?;
         let raw_typed: Raw<ruma::events::AnyMessageLikeEventContent> = Raw::from_json(raw_content);
 
@@ -186,7 +402,21 @@ impl CryptoManager {
             .encrypt_room_event_raw(room_id, event_type, &raw_typed)
             .await?;
 
+        // Process any remaining outgoing requests (e.g., key uploads).
+        self.process_outgoing_requests().await?;
+
         let encrypted_value: Value = serde_json::from_str(encrypted.json().get())?;
+
+        // Log key fields from encrypted content for debugging.
+        info!(
+            room_id = %room_id,
+            session_id = encrypted_value.get("session_id").and_then(|v| v.as_str()).unwrap_or("?"),
+            has_sender_key = encrypted_value.get("sender_key").is_some(),
+            has_device_id = encrypted_value.get("device_id").is_some(),
+            algorithm = encrypted_value.get("algorithm").and_then(|v| v.as_str()).unwrap_or("?"),
+            "encrypt: message encrypted successfully"
+        );
+
         Ok(encrypted_value)
     }
 
@@ -223,16 +453,6 @@ impl CryptoManager {
         })
     }
 
-    /// Check if a room has encryption enabled.
-    pub async fn is_room_encrypted(&self, room_id: &RoomId) -> bool {
-        self.machine
-            .room_settings(room_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-    }
-
     /// Track a room's encryption state.
     ///
     /// Call this when we see an m.room.encryption state event.
@@ -250,15 +470,61 @@ impl CryptoManager {
         Ok(())
     }
 
+    /// Check if a room has encryption enabled in the local crypto store.
+    pub async fn is_room_encrypted_local(&self, room_id: &RoomId) -> bool {
+        self.machine
+            .room_settings(room_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Check if a room has encryption enabled by querying the homeserver.
+    ///
+    /// Falls back to local crypto store if the server query fails.
+    /// If the room is encrypted on the server but not locally tracked,
+    /// automatically marks it as encrypted.
+    pub async fn is_room_encrypted(&self, room_id: &RoomId, matrix_client: &MatrixClient) -> bool {
+        // First check local store (fast path).
+        if self.is_room_encrypted_local(room_id).await {
+            return true;
+        }
+
+        // Query the server for the room encryption state event.
+        match matrix_client.get_room_encryption_event(room_id.as_str()).await {
+            Ok(Some(_)) => {
+                // Server says encrypted but we didn't know locally — sync our state.
+                if let Err(e) = self.set_room_encrypted(room_id).await {
+                    warn!(room_id = %room_id, "failed to sync room encryption state: {e}");
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                debug!(room_id = %room_id, "failed to query room encryption state: {e}");
+                false
+            }
+        }
+    }
+
     /// Track users so their device keys are queried and kept up-to-date.
     ///
+    /// Also claims any missing Olm sessions for the tracked users.
     /// Call this when the bridge bot joins a room — all room members should be
     /// tracked so we can receive Megolm session keys from their devices.
     pub async fn update_tracked_users(&self, user_ids: &[OwnedUserId]) -> anyhow::Result<()> {
+        let _guard = self.lock.write().await;
+
         let refs: Vec<&UserId> = user_ids.iter().map(|u| u.as_ref()).collect();
         self.machine.update_tracked_users(refs).await?;
+
         // Process the resulting key query requests.
         self.process_outgoing_requests().await?;
+
+        // Claim any missing sessions so we're ready to decrypt.
+        self.claim_missing_sessions(user_ids).await?;
+
         debug!(count = user_ids.len(), "tracked users updated");
         Ok(())
     }

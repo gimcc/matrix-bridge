@@ -114,6 +114,17 @@ pub struct AppserviceConfig {
     /// where webhook targets are on the same private network).
     #[serde(default)]
     pub webhook_ssrf_protection: bool,
+    /// Matrix user IDs to auto-invite when the bridge creates a room.
+    /// Example: `["@admin:example.com"]`
+    /// Without this, auto-created rooms are empty (only the bridge bot).
+    #[serde(default)]
+    pub auto_invite: Vec<String>,
+    /// Allow the Bridge API `invite` field in room creation requests.
+    /// When `false` (default), the `invite` field is silently ignored —
+    /// only `auto_invite` from config is used. This prevents external
+    /// services from inviting arbitrary Matrix users.
+    #[serde(default)]
+    pub allow_api_invite: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
