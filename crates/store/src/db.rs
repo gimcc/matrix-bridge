@@ -63,9 +63,7 @@ impl Database {
                     "ALTER TABLE webhooks RENAME COLUMN exclude_sources TO forward_sources",
                 )?;
                 // Reset all values — old blacklist semantics don't carry over.
-                conn.execute_batch(
-                    "UPDATE webhooks SET forward_sources = ''",
-                )?;
+                conn.execute_batch("UPDATE webhooks SET forward_sources = ''")?;
             }
 
             let has_new: bool = conn
