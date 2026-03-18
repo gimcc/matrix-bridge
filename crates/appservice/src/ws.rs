@@ -50,12 +50,18 @@ pub struct WsRegistry {
     count: AtomicUsize,
 }
 
-impl WsRegistry {
-    pub fn new() -> Self {
+impl Default for WsRegistry {
+    fn default() -> Self {
         Self {
             clients: DashMap::new(),
             count: AtomicUsize::new(0),
         }
+    }
+}
+
+impl WsRegistry {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Register a new client for the given platform.
@@ -103,38 +109,54 @@ impl WsRegistry {
     ///
     /// Skips clients whose `exclude_sources` contains `source_platform`.
     /// Uses `try_send` to avoid blocking on slow consumers.
+    ///
+    /// Uses a read lock for iteration (sending) and only acquires a write lock
+    /// when dead clients need to be cleaned up, reducing contention with
+    /// concurrent register/unregister operations on the same shard.
     pub fn broadcast(&self, platform_id: &str, payload: &str, source_platform: Option<&str>) {
-        let Some(mut entry) = self.clients.get_mut(platform_id) else {
-            return;
+        // Phase 1: read lock — iterate and send, collect dead client IDs.
+        let closed_ids = {
+            let Some(entry) = self.clients.get(platform_id) else {
+                return;
+            };
+
+            let mut closed = Vec::new();
+
+            for client in entry.iter() {
+                if let Some(src) = source_platform {
+                    if client.exclude_sources.iter().any(|s| s == src) {
+                        continue;
+                    }
+                }
+                match client.sender.try_send(payload.to_string()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            client_id = client.id,
+                            platform = platform_id,
+                            "ws client channel full, dropping message"
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        closed.push(client.id.clone());
+                    }
+                }
+            }
+
+            closed
         };
+        // Read lock dropped here.
 
-        let mut closed_ids = Vec::new();
-
-        for client in entry.iter() {
-            if let Some(src) = source_platform {
-                if client.exclude_sources.iter().any(|s| s == src) {
-                    continue;
-                }
-            }
-            match client.sender.try_send(payload.to_string()) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        client_id = client.id,
-                        platform = platform_id,
-                        "ws client channel full, dropping message"
-                    );
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    closed_ids.push(client.id.clone());
-                }
-            }
-        }
-
+        // Phase 2: write lock — remove dead clients (only if needed).
         if !closed_ids.is_empty() {
-            let removed = closed_ids.len();
-            entry.retain(|c| !closed_ids.contains(&c.id));
-            self.count.fetch_sub(removed, Ordering::Relaxed);
+            if let Some(mut entry) = self.clients.get_mut(platform_id) {
+                let before = entry.len();
+                entry.retain(|c| !closed_ids.contains(&c.id));
+                let removed = before - entry.len();
+                if removed > 0 {
+                    self.count.fetch_sub(removed, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -163,34 +185,30 @@ fn is_valid_platform_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
 }
 
-/// GET /api/v1/ws?platform=xxx&access_token=yyy&exclude_sources=a,b
+/// Validate WebSocket connection parameters and authenticate.
 ///
-/// Upgrades the HTTP connection to a WebSocket for real-time message delivery.
-pub async fn handle_ws_upgrade(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<WsConnectParams>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    // Validate platform parameter.
+/// Returns `Ok((platform, exclude_sources))` on success, or `Err((status, message))`
+/// on validation/auth failure. Extracted for testability without a real TCP connection.
+fn validate_ws_params(
+    params: &WsConnectParams,
+    state: &AppState,
+) -> Result<(String, Vec<String>), (StatusCode, &'static str)> {
     if !is_valid_platform_id(&params.platform) {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             "invalid platform: must be 1-64 alphanumeric/dash/underscore/dot characters",
-        )
-            .into_response();
+        ));
     }
 
-    // Enforce global connection limit.
     if state.ws_registry.total_clients() >= MAX_WS_CLIENTS {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many ws connections").into_response();
+        return Err((StatusCode::TOO_MANY_REQUESTS, "too many ws connections"));
     }
 
-    // Authenticate if api_key is configured.
     if let Some(ref expected) = state.api_key {
         match &params.access_token {
             Some(token) if auth::verify_token(token, expected) => {}
-            Some(_) => return (StatusCode::FORBIDDEN, "invalid access_token").into_response(),
-            None => return (StatusCode::UNAUTHORIZED, "missing access_token").into_response(),
+            Some(_) => return Err((StatusCode::FORBIDDEN, "invalid access_token")),
+            None => return Err((StatusCode::UNAUTHORIZED, "missing access_token")),
         }
     }
 
@@ -204,6 +222,22 @@ pub async fn handle_ws_upgrade(
         .filter(|s| !s.is_empty() && s.len() <= MAX_EXCLUDE_SOURCE_LEN)
         .take(MAX_EXCLUDE_SOURCES)
         .collect();
+
+    Ok((platform, exclude_sources))
+}
+
+/// GET /api/v1/ws?platform=xxx&access_token=yyy&exclude_sources=a,b
+///
+/// Upgrades the HTTP connection to a WebSocket for real-time message delivery.
+pub async fn handle_ws_upgrade(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<WsConnectParams>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let (platform, exclude_sources) = match validate_ws_params(&params, &state) {
+        Ok(v) => v,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
 
     ws.on_upgrade(move |socket| handle_ws_session(state, platform, exclude_sources, socket))
 }
@@ -278,8 +312,18 @@ async fn handle_ws_session(
 
     // Wait for either task to finish, then abort the other to prevent leaks.
     tokio::select! {
-        _ = &mut outbound => { inbound.abort(); }
-        _ = &mut inbound => { outbound.abort(); }
+        result = &mut outbound => {
+            if let Err(e) = result {
+                warn!(client_id = client_id.as_str(), platform = platform.as_str(), "ws outbound task panicked: {e}");
+            }
+            inbound.abort();
+        }
+        result = &mut inbound => {
+            if let Err(e) = result {
+                warn!(client_id = client_id.as_str(), platform = platform.as_str(), "ws inbound task panicked: {e}");
+            }
+            outbound.abort();
+        }
     }
 
     state.ws_registry.unregister(&platform, &client_id);
@@ -381,5 +425,152 @@ mod tests {
 
         registry.unregister("a", &id3);
         assert_eq!(registry.total_clients(), 2);
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let registry = WsRegistry::default();
+        assert_eq!(registry.total_clients(), 0);
+    }
+
+    // --- Validation tests ---
+    //
+    // Test the `validate_ws_params` function directly, which covers the
+    // 400/401/403/429 rejection logic without needing a real TCP/WebSocket
+    // connection (axum's `WebSocketUpgrade` extractor requires one).
+
+    mod validation_tests {
+        use super::*;
+        use crate::dispatcher::Dispatcher;
+        use crate::matrix_client::MatrixClient;
+        use crate::puppet_manager::PuppetManager;
+
+        /// Build a minimal AppState with a real (but dummy) Dispatcher.
+        fn test_state(api_key: Option<String>, ws_registry: Arc<WsRegistry>) -> AppState {
+            let client = MatrixClient::new("http://localhost:0", "test_token", "localhost");
+            let db = matrix_bridge_store::Database::open_in_memory().expect("in-memory db");
+            let puppet_mgr = Arc::new(PuppetManager::new(client.clone(), db.clone(), None));
+            let dispatcher = Dispatcher::new(
+                puppet_mgr,
+                client,
+                db,
+                "localhost",
+                "bridge",
+                "bot",
+                Default::default(),
+                ws_registry.clone(),
+            );
+
+            AppState {
+                dispatcher: Arc::new(tokio::sync::Mutex::new(dispatcher)),
+                processed_txns: tokio::sync::Mutex::new(indexmap::IndexSet::new()),
+                crypto_pool: None,
+                webhook_ssrf_protection: false,
+                auto_invite: vec![],
+                allow_api_invite: false,
+                encryption_default: false,
+                bridge_info: crate::server::BridgeInfo {
+                    homeserver_url: String::new(),
+                    homeserver_domain: String::new(),
+                    bot_user_id: String::new(),
+                    puppet_prefix: String::new(),
+                    encryption_enabled: false,
+                    encryption_default: false,
+                    webhook_ssrf_protection: false,
+                    api_key_required: api_key.is_some(),
+                    configured_platforms: vec![],
+                    invite_whitelist: vec![],
+                },
+                ws_registry,
+                api_key,
+            }
+        }
+
+        fn params(platform: &str, token: Option<&str>, exclude: Option<&str>) -> WsConnectParams {
+            WsConnectParams {
+                platform: platform.to_string(),
+                access_token: token.map(|s| s.to_string()),
+                exclude_sources: exclude.map(|s| s.to_string()),
+            }
+        }
+
+        #[test]
+        fn rejects_invalid_platform() {
+            let state = test_state(None, Arc::new(WsRegistry::new()));
+            let result = validate_ws_params(&params("has space", None, None), &state);
+            assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
+
+        #[test]
+        fn rejects_empty_platform() {
+            let state = test_state(None, Arc::new(WsRegistry::new()));
+            let result = validate_ws_params(&params("", None, None), &state);
+            assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
+
+        #[test]
+        fn rejects_missing_token_when_required() {
+            let state = test_state(Some("secret123".to_string()), Arc::new(WsRegistry::new()));
+            let result = validate_ws_params(&params("telegram", None, None), &state);
+            assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        }
+
+        #[test]
+        fn rejects_invalid_token() {
+            let state = test_state(Some("secret123".to_string()), Arc::new(WsRegistry::new()));
+            let result = validate_ws_params(&params("telegram", Some("wrong"), None), &state);
+            assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+        }
+
+        #[test]
+        fn accepts_valid_token() {
+            let state = test_state(Some("secret123".to_string()), Arc::new(WsRegistry::new()));
+            let result = validate_ws_params(&params("telegram", Some("secret123"), None), &state);
+            let (platform, _) = result.unwrap();
+            assert_eq!(platform, "telegram");
+        }
+
+        #[test]
+        fn rejects_when_connection_limit_reached() {
+            let registry = Arc::new(WsRegistry::new());
+            let _rxs: Vec<_> = (0..MAX_WS_CLIENTS)
+                .map(|i| {
+                    let (_id, rx) = registry.register(&format!("p{i}"), vec![]);
+                    rx
+                })
+                .collect();
+
+            let state = test_state(None, registry);
+            let result = validate_ws_params(&params("telegram", None, None), &state);
+            assert_eq!(result.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        #[test]
+        fn allows_unauthenticated_when_no_api_key() {
+            let state = test_state(None, Arc::new(WsRegistry::new()));
+            let result = validate_ws_params(&params("telegram", None, None), &state);
+            let (platform, exclude) = result.unwrap();
+            assert_eq!(platform, "telegram");
+            assert!(exclude.is_empty());
+        }
+
+        #[test]
+        fn parses_exclude_sources() {
+            let state = test_state(None, Arc::new(WsRegistry::new()));
+            let result =
+                validate_ws_params(&params("telegram", None, Some("matrix, slack")), &state);
+            let (_, exclude) = result.unwrap();
+            assert_eq!(exclude, vec!["matrix", "slack"]);
+        }
+
+        #[test]
+        fn filters_empty_and_oversized_exclude_sources() {
+            let state = test_state(None, Arc::new(WsRegistry::new()));
+            let long = "x".repeat(MAX_EXCLUDE_SOURCE_LEN + 1);
+            let input = format!("ok,,{long},valid");
+            let result = validate_ws_params(&params("telegram", None, Some(&input)), &state);
+            let (_, exclude) = result.unwrap();
+            assert_eq!(exclude, vec!["ok", "valid"]);
+        }
     }
 }
