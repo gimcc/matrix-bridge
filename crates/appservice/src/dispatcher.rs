@@ -218,9 +218,7 @@ impl Dispatcher {
         }
 
         // When the bot joins a room, track all room members' devices.
-        if is_bot
-            && let Some(pool) = pool
-        {
+        if is_bot && let Some(pool) = pool {
             let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
             if let Ok(ruma_room_id) = ruma_room_id
                 && pool
@@ -834,8 +832,7 @@ impl Dispatcher {
                 if pool.is_per_user()
                     && let Some(device_id) = pool.device_id_for_user(&sender_user_id).await
                 {
-                    let puppet_client =
-                        self.matrix_client.with_user_device(as_user, &device_id);
+                    let puppet_client = self.matrix_client.with_user_device(as_user, &device_id);
                     return puppet_client
                         .send_encrypted_message(room_id, &encrypted, as_user, txn_id)
                         .await;

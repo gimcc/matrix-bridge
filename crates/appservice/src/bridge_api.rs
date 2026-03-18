@@ -549,7 +549,8 @@ async fn handle_create_room_mapping(
         Ok(Some(existing)) => {
             // If caller provided a specific matrix_room_id that differs, update it.
             if let Some(ref wanted) = req.matrix_room_id
-                && !wanted.is_empty() && wanted != &existing.matrix_room_id
+                && !wanted.is_empty()
+                && wanted != &existing.matrix_room_id
             {
                 match dispatcher
                     .db()
