@@ -3,7 +3,8 @@ use std::path::Path;
 
 use matrix_sdk_crypto::{
     CrossSigningBootstrapRequests, DecryptionSettings, EncryptionSettings, EncryptionSyncChanges,
-    OlmMachine, TrustRequirement, store::types::RoomSettings,
+    OlmMachine, TrustRequirement,
+    store::types::RoomSettings,
     types::EventEncryptionAlgorithm,
     types::requests::{AnyIncomingResponse, AnyOutgoingRequest},
 };
@@ -63,7 +64,14 @@ impl CryptoManager {
             );
         }
 
-        let mut cm = Self::open(user_id, device_id, store_path, passphrase, matrix_client.clone()).await?;
+        let mut cm = Self::open(
+            user_id,
+            device_id,
+            store_path,
+            passphrase,
+            matrix_client.clone(),
+        )
+        .await?;
 
         // Upload any pending keys (fresh store) or process OTK replenishment.
         cm.process_outgoing_requests().await?;
@@ -131,7 +139,10 @@ impl CryptoManager {
         let dir_name = {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(localpart.as_bytes());
-            hash[..16].iter().map(|b| format!("{b:02x}")).collect::<String>()
+            hash[..16]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         };
         let store_path = Path::new(base_store_path).join("puppets").join(dir_name);
         std::fs::create_dir_all(&store_path)?;
@@ -214,7 +225,8 @@ impl CryptoManager {
         let outgoing = self.machine.outgoing_requests().await?;
 
         for request in outgoing {
-            self.dispatch_outgoing_request(request.request_id(), request.request()).await?;
+            self.dispatch_outgoing_request(request.request_id(), request.request())
+                .await?;
         }
 
         Ok(())
@@ -237,14 +249,11 @@ impl CryptoManager {
                     otk_counts = ?resp.one_time_key_counts,
                     "keys uploaded"
                 );
-                self.machine
-                    .mark_request_as_sent(request_id, &resp)
-                    .await?;
+                self.machine.mark_request_as_sent(request_id, &resp).await?;
             }
             AnyOutgoingRequest::KeysQuery(req) => {
-                let queried_users: Vec<String> = req.device_keys.keys()
-                    .map(|u| u.to_string())
-                    .collect();
+                let queried_users: Vec<String> =
+                    req.device_keys.keys().map(|u| u.to_string()).collect();
                 info!(users = ?queried_users, "keys query: requesting device keys");
                 let resp = self.matrix_client.query_keys_raw(req).await?;
                 // Log how many devices we got for each user.
@@ -256,14 +265,11 @@ impl CryptoManager {
                         "keys query: got devices"
                     );
                 }
-                self.machine
-                    .mark_request_as_sent(request_id, &resp)
-                    .await?;
+                self.machine.mark_request_as_sent(request_id, &resp).await?;
             }
             AnyOutgoingRequest::KeysClaim(req) => {
-                let claim_users: Vec<String> = req.one_time_keys.keys()
-                    .map(|u| u.to_string())
-                    .collect();
+                let claim_users: Vec<String> =
+                    req.one_time_keys.keys().map(|u| u.to_string()).collect();
                 info!(users = ?claim_users, "keys claim: claiming OTKs");
                 let resp = self.matrix_client.claim_keys_raw(req).await?;
                 for (user_id, devices) in &resp.one_time_keys {
@@ -273,31 +279,26 @@ impl CryptoManager {
                         "keys claim: got OTKs"
                     );
                 }
-                self.machine
-                    .mark_request_as_sent(request_id, &resp)
-                    .await?;
+                self.machine.mark_request_as_sent(request_id, &resp).await?;
             }
             AnyOutgoingRequest::ToDeviceRequest(req) => {
-                let recipient_count: usize = req.messages.values()
-                    .map(|devices| devices.len())
-                    .sum();
+                let recipient_count: usize =
+                    req.messages.values().map(|devices| devices.len()).sum();
                 debug!(
                     event_type = %req.event_type,
                     recipients = recipient_count,
                     "sending to-device event"
                 );
                 let resp = self.matrix_client.send_to_device_raw(req).await?;
-                self.machine
-                    .mark_request_as_sent(request_id, &resp)
-                    .await?;
+                self.machine.mark_request_as_sent(request_id, &resp).await?;
             }
             AnyOutgoingRequest::SignatureUpload(req) => {
                 let signed_keys_json = serde_json::to_value(&req.signed_keys)?;
-                self.matrix_client.upload_signatures(&signed_keys_json).await?;
-                let resp = ruma::api::client::keys::upload_signatures::v3::Response::new();
-                self.machine
-                    .mark_request_as_sent(request_id, &resp)
+                self.matrix_client
+                    .upload_signatures(&signed_keys_json)
                     .await?;
+                let resp = ruma::api::client::keys::upload_signatures::v3::Response::new();
+                self.machine.mark_request_as_sent(request_id, &resp).await?;
                 info!("cross-signing signatures uploaded via outgoing request");
             }
             _ => {
@@ -316,9 +317,8 @@ impl CryptoManager {
         let claim_req = self.machine.get_missing_sessions(refs.into_iter()).await?;
 
         if let Some((txn_id, req)) = claim_req {
-            let claim_users: Vec<String> = req.one_time_keys.keys()
-                .map(|u| u.to_string())
-                .collect();
+            let claim_users: Vec<String> =
+                req.one_time_keys.keys().map(|u| u.to_string()).collect();
             info!(users = ?claim_users, "claiming missing Olm sessions");
             let resp = self.matrix_client.claim_keys_raw(&req).await?;
             self.machine.mark_request_as_sent(&txn_id, &resp).await?;
@@ -529,7 +529,10 @@ impl CryptoManager {
         }
 
         // Query the server for the room encryption state event.
-        match matrix_client.get_room_encryption_event(room_id.as_str()).await {
+        match matrix_client
+            .get_room_encryption_event(room_id.as_str())
+            .await
+        {
             Ok(Some(_)) => {
                 // Server says encrypted but we didn't know locally — sync our state.
                 if let Err(e) = self.set_room_encrypted(room_id).await {
@@ -582,10 +585,7 @@ impl CryptoManager {
 
         info!(
             has_master,
-            has_self_signing,
-            has_user_signing,
-            reset,
-            "cross-signing status before bootstrap"
+            has_self_signing, has_user_signing, reset, "cross-signing status before bootstrap"
         );
 
         let CrossSigningBootstrapRequests {
@@ -596,7 +596,8 @@ impl CryptoManager {
 
         // Step 1: Upload device keys if needed (fresh account).
         if let Some(req) = upload_keys_req {
-            self.dispatch_outgoing_request(req.request_id(), req.request()).await?;
+            self.dispatch_outgoing_request(req.request_id(), req.request())
+                .await?;
             info!("cross-signing: device keys uploaded");
         }
 

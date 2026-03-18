@@ -59,3 +59,8 @@ indexmap = { workspace = true }
 base64 = "0.22"
 getrandom = "0.2"
 serde_yaml = { workspace = true }
+
+[profile.release]
+lto = true
+panic = "abort"
+strip = "debuginfo"

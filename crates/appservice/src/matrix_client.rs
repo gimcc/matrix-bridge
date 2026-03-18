@@ -727,10 +727,7 @@ impl MatrixClient {
     /// Upload cross-signing signatures (device key signatures, etc.).
     ///
     /// Corresponds to `POST /_matrix/client/v3/keys/signatures/upload`.
-    pub async fn upload_signatures(
-        &self,
-        signed_keys: &Value,
-    ) -> anyhow::Result<()> {
+    pub async fn upload_signatures(&self, signed_keys: &Value) -> anyhow::Result<()> {
         let url = format!(
             "{}/_matrix/client/v3/keys/signatures/upload",
             self.homeserver_url
