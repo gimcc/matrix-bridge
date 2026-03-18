@@ -250,9 +250,7 @@ async fn handle_ws_session(
     exclude_sources: Vec<String>,
     socket: axum::extract::ws::WebSocket,
 ) {
-    let (client_id, mut rx) = state
-        .ws_registry
-        .register(&platform, exclude_sources);
+    let (client_id, mut rx) = state.ws_registry.register(&platform, exclude_sources);
 
     info!(
         client_id,

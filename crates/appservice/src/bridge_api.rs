@@ -302,7 +302,10 @@ pub fn build_bridge_api_router() -> Router<Arc<AppState>> {
         // Room mapping API
         .route("/api/v1/admin/rooms", post(handle_create_room_mapping))
         .route("/api/v1/admin/rooms", get(handle_list_room_mappings))
-        .route("/api/v1/admin/rooms/{id}", delete(handle_delete_room_mapping))
+        .route(
+            "/api/v1/admin/rooms/{id}",
+            delete(handle_delete_room_mapping),
+        )
         // Webhook API
         .route("/api/v1/admin/webhooks", post(handle_create_webhook))
         .route("/api/v1/admin/webhooks", get(handle_list_webhooks))
@@ -877,9 +880,7 @@ async fn handle_list_messages(
 ///   "puppets": [ ... ]
 /// }
 /// ```
-async fn handle_crypto_status(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_crypto_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(pool) = &state.crypto_pool else {
         return (
             StatusCode::OK,
@@ -957,9 +958,7 @@ async fn handle_crypto_status(
 ///   }
 /// }
 /// ```
-async fn handle_server_info(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_server_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let info = &state.bridge_info;
 
     let dispatcher = state.dispatcher.lock().await;
