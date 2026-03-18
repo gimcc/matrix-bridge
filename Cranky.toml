@@ -1,0 +1,14 @@
+[deny]
+clippy = [
+    "unsafe_code",
+    "unwrap_used",
+    "expect_used",
+    "panic",
+    "indexing_slicing",
+    "dbg_macro",
+]
+
+[allow]
+clippy = [
+    "result_large_err",
+]

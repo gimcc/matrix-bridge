@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ruma::{
-    OwnedUserId, OneTimeKeyAlgorithm, UInt, UserId,
-    api::client::sync::sync_events::DeviceLists,
+    OneTimeKeyAlgorithm, OwnedUserId, UInt, UserId, api::client::sync::sync_events::DeviceLists,
     events::AnyToDeviceEvent, serde::Raw,
 };
 use serde_json::Value;
@@ -131,10 +130,9 @@ impl CryptoManagerPool {
             .await?;
 
         // Create a per-user MatrixClient clone.
-        let puppet_client = self.matrix_client.with_user_device(
-            user_id.as_str(),
-            device_id.as_str(),
-        );
+        let puppet_client = self
+            .matrix_client
+            .with_user_device(user_id.as_str(), device_id.as_str());
 
         // Create the CryptoManager with per-puppet store.
         let cm = CryptoManager::new_for_puppet(
@@ -179,18 +177,22 @@ impl CryptoManagerPool {
         changed_devices: &DeviceLists,
         otk_counts: &BTreeMap<OneTimeKeyAlgorithm, UInt>,
         fallback_keys: Option<&[OneTimeKeyAlgorithm]>,
-        per_user_otk_counts: &std::collections::HashMap<OwnedUserId, BTreeMap<OneTimeKeyAlgorithm, UInt>>,
-        per_user_fallback_keys: &std::collections::HashMap<OwnedUserId, Option<Vec<OneTimeKeyAlgorithm>>>,
+        per_user_otk_counts: &std::collections::HashMap<
+            OwnedUserId,
+            BTreeMap<OneTimeKeyAlgorithm, UInt>,
+        >,
+        per_user_fallback_keys: &std::collections::HashMap<
+            OwnedUserId,
+            Option<Vec<OneTimeKeyAlgorithm>>,
+        >,
         per_user_to_device: &std::collections::HashMap<OwnedUserId, Vec<Raw<AnyToDeviceEvent>>>,
     ) -> anyhow::Result<()> {
         if !self.per_user {
             // Single-device mode: all events go to bot.
-            return self.bot.receive_sync_changes(
-                to_device_events,
-                changed_devices,
-                otk_counts,
-                fallback_keys,
-            ).await;
+            return self
+                .bot
+                .receive_sync_changes(to_device_events, changed_devices, otk_counts, fallback_keys)
+                .await;
         }
 
         // Per-user mode:
@@ -221,12 +223,16 @@ impl CryptoManagerPool {
             .or_else(|| fallback_keys.map(|s| s.to_vec()));
 
         // Bot always gets device list changes + its own to-device + OTK.
-        if let Err(e) = self.bot.receive_sync_changes(
-            bot_to_device,
-            changed_devices,
-            &bot_otk,
-            bot_fallback.as_deref(),
-        ).await {
+        if let Err(e) = self
+            .bot
+            .receive_sync_changes(
+                bot_to_device,
+                changed_devices,
+                &bot_otk,
+                bot_fallback.as_deref(),
+            )
+            .await
+        {
             error!("bot crypto sync failed: {e}");
         }
 
@@ -242,10 +248,7 @@ impl CryptoManagerPool {
             .collect();
 
         for user_id in &puppet_user_ids {
-            let puppet_to_device = per_user_to_device
-                .get(user_id)
-                .cloned()
-                .unwrap_or_default();
+            let puppet_to_device = per_user_to_device.get(user_id).cloned().unwrap_or_default();
             let has_to_device = !puppet_to_device.is_empty();
 
             // Eagerly initialize puppets that receive to-device events.
@@ -275,17 +278,17 @@ impl CryptoManagerPool {
                 .get(user_id)
                 .cloned()
                 .unwrap_or_default();
-            let puppet_fallback = per_user_fallback_keys
-                .get(user_id)
-                .cloned()
-                .flatten();
+            let puppet_fallback = per_user_fallback_keys.get(user_id).cloned().flatten();
 
-            if let Err(e) = cm.receive_sync_changes(
-                puppet_to_device,
-                changed_devices,
-                &puppet_otk,
-                puppet_fallback.as_deref(),
-            ).await {
+            if let Err(e) = cm
+                .receive_sync_changes(
+                    puppet_to_device,
+                    changed_devices,
+                    &puppet_otk,
+                    puppet_fallback.as_deref(),
+                )
+                .await
+            {
                 warn!(user_id = %user_id, "puppet crypto sync failed: {e}");
             }
         }
@@ -299,12 +302,10 @@ impl CryptoManagerPool {
                 if *user_id == bot_user_id || puppet_user_ids.contains(user_id) {
                     continue;
                 }
-                if let Err(e) = cm.receive_sync_changes(
-                    vec![],
-                    changed_devices,
-                    &empty_otk,
-                    None,
-                ).await {
+                if let Err(e) = cm
+                    .receive_sync_changes(vec![], changed_devices, &empty_otk, None)
+                    .await
+                {
                     warn!(user_id = %user_id, "puppet device list sync failed: {e}");
                 }
             }

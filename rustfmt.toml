@@ -1,0 +1,6 @@
+# Stable options
+edition = "2024"
+
+# Unstable options (require nightly rustfmt via `cargo +nightly fmt`)
+# imports_granularity = "Module"
+# group_imports = "StdExternalCrate"

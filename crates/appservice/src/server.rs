@@ -186,8 +186,7 @@ async fn handle_transaction(
             HashMap::new()
         };
 
-        if !raw_events.is_empty() || !changed_devices.changed.is_empty() || !otk_counts.is_empty()
-        {
+        if !raw_events.is_empty() || !changed_devices.changed.is_empty() || !otk_counts.is_empty() {
             debug!(
                 to_device = raw_events.len(),
                 device_list_changed = changed_devices.changed.len(),
@@ -341,10 +340,9 @@ fn parse_per_user_otk_counts(
             // (each puppet has only one device, so this is a simple merge).
             let mut user_counts = BTreeMap::new();
             for (_device_id, counts_val) in devices {
-                if let Ok(counts) =
-                    serde_json::from_value::<BTreeMap<ruma::OneTimeKeyAlgorithm, ruma::UInt>>(
-                        counts_val.clone(),
-                    )
+                if let Ok(counts) = serde_json::from_value::<
+                    BTreeMap<ruma::OneTimeKeyAlgorithm, ruma::UInt>,
+                >(counts_val.clone())
                 {
                     user_counts.extend(counts);
                 }
@@ -373,8 +371,7 @@ fn parse_per_user_fallback_keys(
     HashMap<OwnedUserId, Option<Vec<ruma::OneTimeKeyAlgorithm>>>,
 ) {
     let mut flat: Option<Vec<ruma::OneTimeKeyAlgorithm>> = None;
-    let mut per_user: HashMap<OwnedUserId, Option<Vec<ruma::OneTimeKeyAlgorithm>>> =
-        HashMap::new();
+    let mut per_user: HashMap<OwnedUserId, Option<Vec<ruma::OneTimeKeyAlgorithm>>> = HashMap::new();
 
     let Some(raw) = raw else {
         return (flat, per_user);

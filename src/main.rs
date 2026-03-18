@@ -165,9 +165,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             None => {
-                anyhow::bail!(
-                    "as_token missing in {reg_path}. Delete {reg_path} to regenerate."
-                );
+                anyhow::bail!("as_token missing in {reg_path}. Delete {reg_path} to regenerate.");
             }
             _ => {}
         }
@@ -179,9 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             None => {
-                anyhow::bail!(
-                    "hs_token missing in {reg_path}. Delete {reg_path} to regenerate."
-                );
+                anyhow::bail!("hs_token missing in {reg_path}. Delete {reg_path} to regenerate.");
             }
             _ => {}
         }
