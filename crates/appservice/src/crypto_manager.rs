@@ -212,7 +212,7 @@ impl CryptoManager {
         let has_device = resp
             .device_keys
             .get(&user_id)
-            .map_or(false, |devices| !devices.is_empty());
+            .is_some_and(|devices| !devices.is_empty());
 
         Ok(has_device)
     }
@@ -607,17 +607,17 @@ impl CryptoManager {
             let master_json = upload_signing_keys_req
                 .master_key
                 .as_ref()
-                .map(|k| serde_json::to_value(k))
+                .map(serde_json::to_value)
                 .transpose()?;
             let self_signing_json = upload_signing_keys_req
                 .self_signing_key
                 .as_ref()
-                .map(|k| serde_json::to_value(k))
+                .map(serde_json::to_value)
                 .transpose()?;
             let user_signing_json = upload_signing_keys_req
                 .user_signing_key
                 .as_ref()
-                .map(|k| serde_json::to_value(k))
+                .map(serde_json::to_value)
                 .transpose()?;
 
             self.matrix_client

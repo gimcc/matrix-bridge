@@ -373,6 +373,7 @@ fn parse_per_user_otk_counts(
 /// Supports two formats:
 /// - Per-user: `{ "@user:server": { "DEVICE": ["signed_curve25519"] } }`
 /// - Legacy flat: `["signed_curve25519"]`
+#[allow(clippy::type_complexity)]
 fn parse_per_user_fallback_keys(
     raw: &Option<Value>,
 ) -> (
@@ -400,11 +401,10 @@ fn parse_per_user_fallback_keys(
                 continue;
             };
             // Flatten per-device to per-user (take first device's types).
-            for (_device_id, types_val) in devices {
+            if let Some((_device_id, types_val)) = devices.into_iter().next() {
                 let types: Option<Vec<ruma::OneTimeKeyAlgorithm>> =
                     serde_json::from_value(types_val.clone()).ok();
                 per_user.insert(user_id.clone(), types);
-                break;
             }
         }
     }
@@ -431,13 +431,13 @@ fn parse_per_user_to_device(
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<OwnedUserId>().ok());
 
-        if let Some(user_id) = to_user {
-            if let Ok(raw_val) = serde_json::value::to_raw_value(event) {
-                result
-                    .entry(user_id)
-                    .or_default()
-                    .push(ruma::serde::Raw::from_json(raw_val));
-            }
+        if let Some(user_id) = to_user
+            && let Ok(raw_val) = serde_json::value::to_raw_value(event)
+        {
+            result
+                .entry(user_id)
+                .or_default()
+                .push(ruma::serde::Raw::from_json(raw_val));
         }
         // Events without to_user_id are dropped in per-user mode
         // (they shouldn't exist per MSC3202).

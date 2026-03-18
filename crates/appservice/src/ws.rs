@@ -123,10 +123,10 @@ impl WsRegistry {
             let mut closed = Vec::new();
 
             for client in entry.iter() {
-                if let Some(src) = source_platform {
-                    if client.exclude_sources.iter().any(|s| s == src) {
-                        continue;
-                    }
+                if let Some(src) = source_platform
+                    && client.exclude_sources.iter().any(|s| s == src)
+                {
+                    continue;
                 }
                 match client.sender.try_send(payload.to_string()) {
                     Ok(()) => {}
@@ -148,14 +148,14 @@ impl WsRegistry {
         // Read lock dropped here.
 
         // Phase 2: write lock — remove dead clients (only if needed).
-        if !closed_ids.is_empty() {
-            if let Some(mut entry) = self.clients.get_mut(platform_id) {
-                let before = entry.len();
-                entry.retain(|c| !closed_ids.contains(&c.id));
-                let removed = before - entry.len();
-                if removed > 0 {
-                    self.count.fetch_sub(removed, Ordering::Relaxed);
-                }
+        if !closed_ids.is_empty()
+            && let Some(mut entry) = self.clients.get_mut(platform_id)
+        {
+            let before = entry.len();
+            entry.retain(|c| !closed_ids.contains(&c.id));
+            let removed = before - entry.len();
+            if removed > 0 {
+                self.count.fetch_sub(removed, Ordering::Relaxed);
             }
         }
     }
@@ -301,9 +301,8 @@ async fn handle_ws_session(
     // Inbound: client → server (only handle Close/Pong, ignore others).
     let mut inbound = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
-            match msg {
-                Message::Close(_) => break,
-                _ => {} // Pong is auto-handled by axum; ignore text/binary from client.
+            if let Message::Close(_) = msg {
+                break;
             }
         }
     });

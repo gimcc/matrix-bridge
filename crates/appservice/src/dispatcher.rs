@@ -43,6 +43,7 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         puppet_manager: Arc<PuppetManager>,
         matrix_client: MatrixClient,
@@ -161,21 +162,19 @@ impl Dispatcher {
         }
 
         // Track device keys for new joins/invites in encrypted rooms.
-        if membership == "join" || membership == "invite" {
-            if let Some(pool) = pool {
-                let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
-                if let Ok(ruma_room_id) = ruma_room_id
-                    && pool
-                        .bot()
-                        .is_room_encrypted(ruma_room_id, &self.matrix_client)
-                        .await
-                {
-                    if let Ok(user_id) = state_key.parse::<ruma::OwnedUserId>() {
-                        if let Err(e) = pool.bot().update_tracked_users(&[user_id]).await {
-                            warn!(room_id, state_key, "failed to track member devices: {e}");
-                        }
-                    }
-                }
+        if (membership == "join" || membership == "invite")
+            && let Some(pool) = pool
+        {
+            let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
+            if let Ok(ruma_room_id) = ruma_room_id
+                && pool
+                    .bot()
+                    .is_room_encrypted(ruma_room_id, &self.matrix_client)
+                    .await
+                && let Ok(user_id) = state_key.parse::<ruma::OwnedUserId>()
+                && let Err(e) = pool.bot().update_tracked_users(&[user_id]).await
+            {
+                warn!(room_id, state_key, "failed to track member devices: {e}");
             }
         }
 
@@ -219,18 +218,18 @@ impl Dispatcher {
         }
 
         // When the bot joins a room, track all room members' devices.
-        if is_bot {
-            if let Some(pool) = pool {
-                let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
-                if let Ok(ruma_room_id) = ruma_room_id
-                    && pool
-                        .bot()
-                        .is_room_encrypted(ruma_room_id, &self.matrix_client)
-                        .await
-                    && let Err(e) = self.update_tracked_users_pool(room_id, pool).await
-                {
-                    warn!(room_id, "failed to track users after bot join: {e}");
-                }
+        if is_bot
+            && let Some(pool) = pool
+        {
+            let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
+            if let Ok(ruma_room_id) = ruma_room_id
+                && pool
+                    .bot()
+                    .is_room_encrypted(ruma_room_id, &self.matrix_client)
+                    .await
+                && let Err(e) = self.update_tracked_users_pool(room_id, pool).await
+            {
+                warn!(room_id, "failed to track users after bot join: {e}");
             }
         }
 
@@ -257,10 +256,10 @@ impl Dispatcher {
         let bot_crypto = pool.bot();
 
         // Ensure the room is tracked as encrypted in our crypto store.
-        if !bot_crypto.is_room_encrypted_local(ruma_room_id).await {
-            if let Err(e) = bot_crypto.set_room_encrypted(ruma_room_id).await {
-                warn!(room_id, "failed to mark room as encrypted: {e}");
-            }
+        if !bot_crypto.is_room_encrypted_local(ruma_room_id).await
+            && let Err(e) = bot_crypto.set_room_encrypted(ruma_room_id).await
+        {
+            warn!(room_id, "failed to mark room as encrypted: {e}");
         }
 
         // Update tracked users to ensure we have device keys for all members.
@@ -832,14 +831,14 @@ impl Dispatcher {
                     .await?;
 
                 // Use per-user MatrixClient for sending if in per-user mode.
-                if pool.is_per_user() {
-                    if let Some(device_id) = pool.device_id_for_user(&sender_user_id).await {
-                        let puppet_client =
-                            self.matrix_client.with_user_device(as_user, &device_id);
-                        return puppet_client
-                            .send_encrypted_message(room_id, &encrypted, as_user, txn_id)
-                            .await;
-                    }
+                if pool.is_per_user()
+                    && let Some(device_id) = pool.device_id_for_user(&sender_user_id).await
+                {
+                    let puppet_client =
+                        self.matrix_client.with_user_device(as_user, &device_id);
+                    return puppet_client
+                        .send_encrypted_message(room_id, &encrypted, as_user, txn_id)
+                        .await;
                 }
 
                 return self

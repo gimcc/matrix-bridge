@@ -171,6 +171,7 @@ impl CryptoManagerPool {
     ///
     /// Routes to-device events by recipient user, applies per-user OTK counts,
     /// and broadcasts device list changes to all initialized CryptoManagers.
+    #[allow(clippy::too_many_arguments)]
     pub async fn receive_sync_changes(
         &self,
         to_device_events: Vec<Raw<AnyToDeviceEvent>>,
