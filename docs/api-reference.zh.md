@@ -410,7 +410,7 @@ POST /api/v1/admin/webhooks
 | `platform` | string | 是 | 该 Webhook 所属的平台标识 |
 | `url` | string | 是 | 接收回调的 URL（必须使用 `http` 或 `https` 协议；参见 [SSRF 防护](#ssrf-防护)） |
 | `events` | string | 否 | 订阅的事件类型（默认 `"message"`） |
-| `exclude_sources` | array 或 string | 否 | 需要排除的来源平台；支持 JSON 数组 `["telegram", "discord"]` 或逗号分隔字符串 `"telegram,discord"` |
+| `forward_sources` | array 或 string | 否 | 允许转发的来源平台白名单；空（默认）= 拒绝所有，`["*"]` = 转发所有，`["telegram", "discord"]` = 仅转发指定平台。支持 JSON 数组或逗号分隔字符串 |
 
 **请求示例**
 
@@ -419,7 +419,7 @@ POST /api/v1/admin/webhooks
   "platform": "myapp",
   "url": "http://myapp:8080/hook",
   "events": "message",
-  "exclude_sources": ["telegram", "discord"]
+  "forward_sources": ["*"]
 }
 ```
 
@@ -451,7 +451,7 @@ GET /api/v1/admin/webhooks?platform=myapp
       "platform": "myapp",
       "url": "http://myapp:8080/hook",
       "events": "message",
-      "exclude_sources": ["telegram", "discord"]
+      "forward_sources": ["*"]
     }
   ]
 }

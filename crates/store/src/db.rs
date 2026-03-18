@@ -45,19 +45,40 @@ impl Database {
             "migrations/003_message_mapping_multi_platform.sql"
         ))?;
 
-        // Migration 004: Add exclude_sources column (idempotent).
+        // Migration 004: Add forward_sources column (idempotent).
+        // Empty = deny all (nothing forwarded). Set to "*" to forward all,
+        // or comma-separated platform IDs to allow specific sources.
         // SQLite has no "ALTER TABLE ... ADD COLUMN IF NOT EXISTS",
         // so we check the table schema first.
-        let has_column: bool = conn
-            .prepare(
-                "SELECT COUNT(*) FROM pragma_table_info('webhooks') WHERE name = 'exclude_sources'",
-            )?
-            .query_row([], |row| row.get::<_, i64>(0))
-            .map(|count| count > 0)?;
-        if !has_column {
-            conn.execute_batch(
-                "ALTER TABLE webhooks ADD COLUMN exclude_sources TEXT NOT NULL DEFAULT ''",
-            )?;
+        {
+            let has_old: bool = conn
+                .prepare(
+                    "SELECT COUNT(*) FROM pragma_table_info('webhooks') WHERE name = 'exclude_sources'",
+                )?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|count| count > 0)?;
+            if has_old {
+                // Rename old column: drop and recreate (SQLite doesn't support RENAME COLUMN on older versions).
+                conn.execute_batch(
+                    "ALTER TABLE webhooks RENAME COLUMN exclude_sources TO forward_sources",
+                )?;
+                // Reset all values — old blacklist semantics don't carry over.
+                conn.execute_batch(
+                    "UPDATE webhooks SET forward_sources = ''",
+                )?;
+            }
+
+            let has_new: bool = conn
+                .prepare(
+                    "SELECT COUNT(*) FROM pragma_table_info('webhooks') WHERE name = 'forward_sources'",
+                )?
+                .query_row([], |row| row.get::<_, i64>(0))
+                .map(|count| count > 0)?;
+            if !has_new {
+                conn.execute_batch(
+                    "ALTER TABLE webhooks ADD COLUMN forward_sources TEXT NOT NULL DEFAULT ''",
+                )?;
+            }
         }
 
         info!("database migrations applied");

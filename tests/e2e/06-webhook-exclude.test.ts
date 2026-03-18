@@ -1,8 +1,10 @@
 /**
- * Test 6: Webhook exclude_sources filtering.
+ * Test 6: Webhook forward_sources allowlist filtering.
  *
- * When a puppet user sends a message (cross-platform forward), the webhook
- * with that source excluded should NOT receive it.
+ * forward_sources controls which source platforms are forwarded:
+ * - empty = deny all (nothing forwarded)
+ * - ["*"] = forward all
+ * - ["telegram"] = only forward telegram puppet messages
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { env } from "./env";
@@ -36,15 +38,16 @@ beforeAll(async () => {
   const mapping = await bridgeCreateRoomMapping(matrixRoomId, platform, extRoomId);
   mappingId = mapping.id;
 
-  // Webhook A: receives ALL sources.
-  const whAll = await bridgeRegisterWebhook(platform, receiverAll.url);
+  // Webhook A: forward_sources=["*"] → receives ALL sources.
+  const whAll = await bridgeRegisterWebhook(platform, receiverAll.url, ["*"]);
   whAllId = whAll.id;
 
-  // Webhook B: excludes messages originating from "telegram".
+  // Webhook B: forward_sources=["matrix"] → only forwards real Matrix user messages,
+  // NOT puppet messages from telegram or other platforms.
   const whFiltered = await bridgeRegisterWebhook(
     platform,
     receiverFiltered.url,
-    ["telegram"],
+    ["matrix"],
   );
   whFilteredId = whFiltered.id;
 });
@@ -57,7 +60,7 @@ afterAll(async () => {
   await bridgeDeleteRoomMapping(mappingId).catch(() => {});
 });
 
-describe("Webhook exclude_sources", () => {
+describe("Webhook forward_sources", () => {
   test("non-puppet message delivered to both webhooks", async () => {
     const body = `normal_msg_${Date.now()}`;
 
@@ -72,6 +75,7 @@ describe("Webhook exclude_sources", () => {
       },
     ]);
 
+    // Both webhooks allow "matrix" source (A via "*", B explicitly).
     await waitFor(
       () => receiverAll.messages.some((m: any) => m?.message?.content?.body === body),
       { label: "receiverAll gets message", timeout: 10_000 },
@@ -82,7 +86,7 @@ describe("Webhook exclude_sources", () => {
     );
   });
 
-  test("puppet message from excluded source NOT delivered to filtered webhook", async () => {
+  test("puppet message from telegram NOT delivered to matrix-only webhook", async () => {
     const body = `puppet_msg_${Date.now()}`;
     const countFilteredBefore = receiverFiltered.messages.length;
 
@@ -98,13 +102,13 @@ describe("Webhook exclude_sources", () => {
       },
     ]);
 
-    // receiverAll should get it (puppet from telegram → forwarded to test_exclude platform).
+    // receiverAll should get it (forward_sources=["*"]).
     await waitFor(
       () => receiverAll.messages.some((m: any) => m?.message?.content?.body === body),
       { label: "receiverAll gets puppet message", timeout: 10_000 },
     );
 
-    // receiverFiltered should NOT get it (telegram is excluded).
+    // receiverFiltered should NOT get it (forward_sources=["matrix"], telegram not listed).
     await Bun.sleep(2000);
     expect(receiverFiltered.messages.length).toBe(countFilteredBefore);
   });

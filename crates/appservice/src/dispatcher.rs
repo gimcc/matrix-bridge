@@ -560,14 +560,21 @@ impl Dispatcher {
         }
 
         for webhook in &webhooks {
-            if let Some(src) = source_platform
-                && webhook.is_source_excluded(src)
-            {
+            // forward_sources allowlist: empty = deny all, "*" = allow all,
+            // "telegram,discord" = allow only those.
+            let should_forward = match source_platform {
+                Some(src) => webhook.should_forward_source(src),
+                // No source_platform means the message originates from a real
+                // Matrix user (not a puppet).  Treat "matrix" as the source.
+                None => webhook.should_forward_source("matrix"),
+            };
+            if !should_forward {
                 debug!(
                     platform = platform_id,
                     url = webhook.webhook_url,
-                    source = src,
-                    "webhook excluded this source platform"
+                    source = source_platform.unwrap_or("matrix"),
+                    forward_sources = webhook.forward_sources,
+                    "webhook does not forward this source platform"
                 );
                 continue;
             }

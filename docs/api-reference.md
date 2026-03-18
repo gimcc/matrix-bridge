@@ -410,7 +410,7 @@ POST /api/v1/admin/webhooks
 | `platform` | string | Yes | Platform identifier for this webhook |
 | `url` | string | Yes | Callback URL that will receive POST requests (must use `http` or `https` scheme; see [SSRF Protection](#ssrf-protection) below) |
 | `events` | string | No | Event types to subscribe to (default: `"message"`) |
-| `exclude_sources` | array or string | No | Source platforms to exclude from forwarding; accepts a JSON array `["telegram", "discord"]` or a comma-separated string `"telegram,discord"` |
+| `forward_sources` | array or string | No | Allowlist of source platforms to forward; empty (default) = deny all, `["*"]` = forward all, `["telegram", "discord"]` = only those. Accepts a JSON array or comma-separated string |
 
 **Example**
 
@@ -419,7 +419,7 @@ POST /api/v1/admin/webhooks
   "platform": "myapp",
   "url": "http://myapp:8080/hook",
   "events": "message",
-  "exclude_sources": ["telegram", "discord"]
+  "forward_sources": ["*"]
 }
 ```
 
@@ -451,7 +451,7 @@ GET /api/v1/admin/webhooks?platform=myapp
       "platform": "myapp",
       "url": "http://myapp:8080/hook",
       "events": "message",
-      "exclude_sources": ["telegram", "discord"]
+      "forward_sources": ["*"]
     }
   ]
 }

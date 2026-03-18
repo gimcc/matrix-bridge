@@ -59,9 +59,9 @@ beforeAll(async () => {
   mappingIdB = mB.id;
 
   // 4. Register webhooks.
-  const whA = await bridgeRegisterWebhook(platformA, receiverA.url);
+  const whA = await bridgeRegisterWebhook(platformA, receiverA.url, ["*"]);
   webhookIdA = whA.id;
-  const whB = await bridgeRegisterWebhook(platformB, receiverB.url);
+  const whB = await bridgeRegisterWebhook(platformB, receiverB.url, ["*"]);
   webhookIdB = whB.id;
 });
 

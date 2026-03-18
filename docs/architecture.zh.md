@@ -325,26 +325,30 @@ puppet_source_platform("@telegram_user123:domain")  =>  Some("telegram")
 
 此机制始终生效，无法禁用。
 
-### 第二层：按 Webhook 的 `exclude_sources` 过滤
+### 第二层：按 Webhook 的 `forward_sources` 白名单过滤
 
-可配置。每个 Webhook 可以指定一个逗号分隔的来源平台列表，来自这些平台的消息将不会被投递到该 Webhook。
+可配置。每个 Webhook 指定允许转发的来源平台：
+
+- **空**（默认）= 拒绝所有 — 不转发任何消息。
+- `"*"` = 转发所有来源。
+- `"telegram,matrix"` = 仅转发指定平台。
 
 ```
 POST /api/v1/webhooks
 {
   "platform": "slack",
   "url": "https://slack-bot.example.com/webhook",
-  "exclude_sources": ["discord"]
+  "forward_sources": ["telegram", "matrix"]
 }
 ```
 
-在此示例中，Slack Webhook 将接收来自 Telegram、WhatsApp 和原生 Matrix 用户的消息，但不接收来自 Discord 的消息。
+在此示例中，Slack Webhook 将接收来自 Telegram 和原生 Matrix 用户的消息，但不接收来自 Discord 的消息。
 
 检查逻辑在 `Dispatcher::deliver_to_webhooks()` 中：
 
 ```
 对每个 webhook：
-    如果 source_platform 不为空 且 webhook.is_source_excluded(source_platform)：
+    如果 NOT webhook.should_forward_source(source_platform)：
         跳过此 webhook
     否则：
         POST 到 webhook.url
@@ -363,9 +367,9 @@ POST /api/v1/webhooks
   - slack 映射：  通过
   - discord 映射：通过
 
-第二层（每个 webhook 的 exclude_sources）：
-  - Slack webhook (exclude_sources="")：投递
-  - Discord webhook (exclude_sources="telegram")：跳过
+第二层（每个 webhook 的 forward_sources）：
+  - Slack webhook (forward_sources="*")：投递
+  - Discord webhook (forward_sources="matrix")：跳过（telegram 不在白名单中）
 
 结果：消息仅投递到 Slack
 ```
@@ -545,7 +549,7 @@ CREATE TABLE webhooks (
     secret           TEXT,
     events           TEXT NOT NULL DEFAULT 'message',
     enabled          INTEGER NOT NULL DEFAULT 1,
-    exclude_sources  TEXT NOT NULL DEFAULT '',
+    forward_sources  TEXT NOT NULL DEFAULT '',  -- 白名单: 空=拒绝所有, "*"=全部, "telegram,matrix"=指定平台
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(platform_id, webhook_url)
 );

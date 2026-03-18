@@ -34,7 +34,7 @@ const botUserId = `@${env.bridgeBotLocalpart}:${env.domain}`;
 
 beforeAll(async () => {
   receiver = startWebhookReceiver(WEBHOOK_PORT);
-  const wh = await bridgeRegisterWebhook(platform, receiver.url);
+  const wh = await bridgeRegisterWebhook(platform, receiver.url, ["*"]);
   webhookId = wh.id;
   const m = await bridgeCreateRoomMapping(matrixRoomId, platform, extRoomId);
   mappingId = m.id;

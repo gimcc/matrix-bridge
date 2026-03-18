@@ -238,11 +238,11 @@ export async function bridgeSendMessage(opts: {
 export async function bridgeRegisterWebhook(
   platform: string,
   url: string,
-  excludeSources: string[] = [],
+  forwardSources: string[] = [],
 ): Promise<{ id: number }> {
   const resp = await jsonFetch(`${env.bridgeUrl}/api/v1/webhooks`, {
     method: "POST",
-    json: { platform, url, exclude_sources: excludeSources },
+    json: { platform, url, forward_sources: forwardSources },
   });
   if (!resp.ok)
     throw new Error(

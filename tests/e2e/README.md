@@ -45,6 +45,6 @@ bun run test:migration      # Idempotent migration
 | 03 | message-bridge | External -> Matrix | Puppet creation, message delivery, error codes (Bug #1) |
 | 04 | matrix-to-external | Matrix -> External | Transaction processing, webhook delivery, dedup, bot self-skip |
 | 05 | error-codes | - | BridgeError -> HTTP status mapping (Bug #1) |
-| 06 | webhook-exclude | Matrix -> External | exclude_sources filtering, cross-platform puppet forwarding |
+| 06 | webhook-exclude | Matrix -> External | forward_sources allowlist filtering, cross-platform puppet forwarding |
 | 07 | e2ee-flow | Both | Encryption state tracking, decrypt attempt, to-device resilience |
 | 08 | idempotent-migration | - | Migration 004 doesn't crash on restart (Bug #4) |

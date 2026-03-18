@@ -65,7 +65,7 @@ beforeAll(async () => {
   mappingId = mapping.id;
 
   // Register webhook for Matrix → External direction.
-  const wh = await bridgeRegisterWebhook(platform, receiver.url);
+  const wh = await bridgeRegisterWebhook(platform, receiver.url, ["*"]);
   webhookId = wh.id;
 
   // Notify bridge about the encryption state event.

@@ -36,9 +36,9 @@ beforeAll(async () => {
   const m = await bridgeCreateRoomMapping(matrixRoom, platform, extRoom);
   mappingId = m.id;
 
-  const wh1 = await bridgeRegisterWebhook(platform, receiver1.url);
+  const wh1 = await bridgeRegisterWebhook(platform, receiver1.url, ["*"]);
   webhookId1 = wh1.id;
-  const wh2 = await bridgeRegisterWebhook(platform, receiver2.url);
+  const wh2 = await bridgeRegisterWebhook(platform, receiver2.url, ["*"]);
   webhookId2 = wh2.id;
 });
 
@@ -107,7 +107,7 @@ describe("Multiple Webhooks Per Platform", () => {
     expect(new2).toHaveLength(0);
 
     // Re-register webhook 2 for cleanup.
-    const wh2 = await bridgeRegisterWebhook(platform, receiver2.url);
+    const wh2 = await bridgeRegisterWebhook(platform, receiver2.url, ["*"]);
     webhookId2 = wh2.id;
   });
 });

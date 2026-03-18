@@ -31,7 +31,7 @@ beforeAll(async () => {
   receiver = startWebhookReceiver(WEBHOOK_PORT);
   const m = await bridgeCreateRoomMapping(matrixRoom, platform, extRoom);
   mappingId = m.id;
-  const wh = await bridgeRegisterWebhook(platform, receiver.url);
+  const wh = await bridgeRegisterWebhook(platform, receiver.url, ["*"]);
   webhookId = wh.id;
 });
 

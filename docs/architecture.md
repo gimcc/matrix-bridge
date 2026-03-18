@@ -326,26 +326,30 @@ for each mapping:
 
 This is always active and cannot be disabled.
 
-### Layer 2: Per-Webhook `exclude_sources` Filter
+### Layer 2: Per-Webhook `forward_sources` Allowlist
 
-Configurable. Each webhook can specify a comma-separated list of source platforms whose messages it should not receive.
+Configurable. Each webhook specifies which source platforms it accepts:
+
+- **Empty** (default) = deny all — nothing is forwarded.
+- `"*"` = forward all sources.
+- `"telegram,matrix"` = forward only those platforms.
 
 ```
 POST /api/v1/webhooks
 {
   "platform": "slack",
   "url": "https://slack-bot.example.com/webhook",
-  "exclude_sources": ["discord"]
+  "forward_sources": ["telegram", "matrix"]
 }
 ```
 
-In this example, the Slack webhook will receive messages originating from Telegram, WhatsApp, and native Matrix users, but NOT messages originating from Discord.
+In this example, the Slack webhook will receive messages originating from Telegram and native Matrix users, but NOT messages originating from Discord.
 
 The check happens in `Dispatcher::deliver_to_webhooks()`:
 
 ```
 for webhook in webhooks:
-    if source_platform is not None AND webhook.is_source_excluded(source_platform):
+    if NOT webhook.should_forward_source(source_platform):
         SKIP this webhook
     else:
         POST to webhook.url
@@ -364,9 +368,9 @@ Layer 1 (loop prevention):
   - slack mapping:    PASS
   - discord mapping:  PASS
 
-Layer 2 (exclude_sources on each webhook):
-  - Slack webhook (exclude_sources=""): DELIVER
-  - Discord webhook (exclude_sources="telegram"): SKIP
+Layer 2 (forward_sources on each webhook):
+  - Slack webhook (forward_sources="*"): DELIVER
+  - Discord webhook (forward_sources="matrix"): SKIP (telegram not in allowlist)
 
 Result: message delivered to Slack only
 ```
@@ -546,7 +550,7 @@ CREATE TABLE webhooks (
     secret           TEXT,
     events           TEXT NOT NULL DEFAULT 'message',
     enabled          INTEGER NOT NULL DEFAULT 1,
-    exclude_sources  TEXT NOT NULL DEFAULT '',
+    forward_sources  TEXT NOT NULL DEFAULT '',  -- allowlist: empty=deny all, "*"=all, "telegram,matrix"=specific
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(platform_id, webhook_url)
 );

@@ -38,7 +38,7 @@ beforeAll(async () => {
   // Detect if user-level whitelist is active by trying @other's message.
   // If it gets forwarded, the config uses domain wildcard — skip these tests.
   receiver = startWebhookReceiver(WEBHOOK_PORT);
-  const wh = await bridgeRegisterWebhook(platform, receiver.url);
+  const wh = await bridgeRegisterWebhook(platform, receiver.url, ["*"]);
   webhookId = wh.id;
   const m = await bridgeCreateRoomMapping(matrixRoomId, platform, extRoomId);
   mappingId = m.id;

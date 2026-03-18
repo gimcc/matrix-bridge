@@ -57,9 +57,9 @@ beforeAll(async () => {
   const m = await bridgeCreateRoomMapping(matrixRoom, platform, extRoom);
   mappingId = m.id;
 
-  const whGood = await bridgeRegisterWebhook(platform, goodReceiver.url);
+  const whGood = await bridgeRegisterWebhook(platform, goodReceiver.url, ["*"]);
   webhookIdGood = whGood.id;
-  const whFail = await bridgeRegisterWebhook(platform, `http://${process.env.WEBHOOK_HOST ?? "localhost"}:${WEBHOOK_PORT_FAIL}`);
+  const whFail = await bridgeRegisterWebhook(platform, `http://${process.env.WEBHOOK_HOST ?? "localhost"}:${WEBHOOK_PORT_FAIL}`, ["*"]);
   webhookIdFail = whFail.id;
 });
 
@@ -101,7 +101,7 @@ describe("Webhook Resilience", () => {
   test("dead webhook (connection refused) does not block delivery", async () => {
     // Register a webhook on a port where nothing is listening.
     const deadWebhookId = (
-      await bridgeRegisterWebhook(platform, `http://${process.env.WEBHOOK_HOST ?? "localhost"}:19999`)
+      await bridgeRegisterWebhook(platform, `http://${process.env.WEBHOOK_HOST ?? "localhost"}:19999`, ["*"])
     ).id;
 
     const body = `dead_wh_${Date.now()}`;

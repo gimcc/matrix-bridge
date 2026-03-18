@@ -153,11 +153,12 @@ pub struct CreateWebhookRequest {
     pub url: String,
     #[serde(default = "default_events")]
     pub events: String,
-    /// Platform IDs whose messages should NOT be forwarded to this webhook.
-    /// Accepts either a JSON array `["telegram","discord"]` or a
-    /// comma-separated string `"telegram,discord"`.
+    /// Allowlist of source platform IDs whose messages MAY be forwarded.
+    /// - Empty / omitted = deny all (nothing forwarded, default).
+    /// - `["*"]` or `"*"` = forward all sources.
+    /// - `["telegram","discord"]` or `"telegram,discord"` = only those.
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
-    pub exclude_sources: Vec<String>,
+    pub forward_sources: Vec<String>,
 }
 
 fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -714,18 +715,18 @@ async fn handle_create_webhook(
             Json(json!({ "error": format!("invalid webhook URL: {e}") })),
         );
     }
-    let exclude_sources = req.exclude_sources.join(",");
+    let forward_sources = req.forward_sources.join(",");
     let dispatcher = state.dispatcher.lock().await;
     match dispatcher
         .db()
-        .create_webhook(&req.platform, &req.url, &req.events, &exclude_sources)
+        .create_webhook(&req.platform, &req.url, &req.events, &forward_sources)
         .await
     {
         Ok(id) => {
             info!(
                 platform = req.platform,
                 url = req.url,
-                exclude_sources,
+                forward_sources,
                 "webhook registered via API"
             );
             (StatusCode::CREATED, Json(json!({ "id": id })))

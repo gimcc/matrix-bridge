@@ -41,7 +41,7 @@ beforeAll(async () => {
   const mapping = mappings.find((m) => m.external_room_id === extRoom);
   if (!mapping) throw new Error("Portal room was not auto-created");
   realMatrixRoom = mapping.matrix_room_id;
-  const wh = await bridgeRegisterWebhook(platform, receiver.url);
+  const wh = await bridgeRegisterWebhook(platform, receiver.url, ["*"]);
   webhookId = wh.id;
 });
 
