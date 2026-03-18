@@ -23,11 +23,15 @@ fn extract_bearer_token(request: &Request) -> Option<String> {
 }
 
 /// Verify that the request carries a valid token (constant-time comparison).
-fn verify_token(provided: &str, expected: &str) -> bool {
-    if provided.len() != expected.len() {
-        return false;
-    }
-    provided.as_bytes().ct_eq(expected.as_bytes()).into()
+///
+/// Uses HMAC-based comparison to avoid leaking the expected token's length
+/// through timing side-channels. Both inputs are hashed with SHA-256 before
+/// comparison, so the ct_eq always operates on fixed-size (32-byte) digests.
+pub(crate) fn verify_token(provided: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let h_provided = Sha256::digest(provided.as_bytes());
+    let h_expected = Sha256::digest(expected.as_bytes());
+    h_provided.ct_eq(&h_expected).into()
 }
 
 /// Middleware: verify the homeserver token (`hs_token`) on Matrix appservice routes.

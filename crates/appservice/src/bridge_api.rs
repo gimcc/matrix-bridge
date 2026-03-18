@@ -302,7 +302,10 @@ pub fn build_bridge_api_router() -> Router<Arc<AppState>> {
         // Room mapping API
         .route("/api/v1/admin/rooms", post(handle_create_room_mapping))
         .route("/api/v1/admin/rooms", get(handle_list_room_mappings))
-        .route("/api/v1/admin/rooms/{id}", delete(handle_delete_room_mapping))
+        .route(
+            "/api/v1/admin/rooms/{id}",
+            delete(handle_delete_room_mapping),
+        )
         // Webhook API
         .route("/api/v1/admin/webhooks", post(handle_create_webhook))
         .route("/api/v1/admin/webhooks", get(handle_list_webhooks))
@@ -466,21 +469,20 @@ async fn auto_create_room(
 
     // Register encryption state and track member devices so
     // other clients share Megolm session keys with the bridge.
-    if state.encryption_default {
-        if let Some(pool) = &state.crypto_pool {
-            if let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(id.as_str()) {
-                if let Err(e) = pool.bot().set_room_encrypted(ruma_room_id).await {
-                    error!(room_id = %id, "failed to mark room as encrypted: {e}");
-                }
-                // Query device keys for invited members.
-                let members: Vec<ruma::OwnedUserId> =
-                    invite.iter().filter_map(|u| u.parse().ok()).collect();
-                if !members.is_empty() {
-                    if let Err(e) = pool.bot().update_tracked_users(&members).await {
-                        error!(room_id = %id, "failed to track user devices: {e}");
-                    }
-                }
-            }
+    if state.encryption_default
+        && let Some(pool) = &state.crypto_pool
+        && let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(id.as_str())
+    {
+        if let Err(e) = pool.bot().set_room_encrypted(ruma_room_id).await {
+            error!(room_id = %id, "failed to mark room as encrypted: {e}");
+        }
+        // Query device keys for invited members.
+        let members: Vec<ruma::OwnedUserId> =
+            invite.iter().filter_map(|u| u.parse().ok()).collect();
+        if !members.is_empty()
+            && let Err(e) = pool.bot().update_tracked_users(&members).await
+        {
+            error!(room_id = %id, "failed to track user devices: {e}");
         }
     }
 
@@ -503,13 +505,13 @@ async fn handle_create_room_mapping(
     Json(req): Json<CreateRoomMappingRequest>,
 ) -> impl IntoResponse {
     // Validate room_name length.
-    if let Some(ref name) = req.room_name {
-        if name.len() > 255 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "room_name exceeds 255 characters" })),
-            );
-        }
+    if let Some(ref name) = req.room_name
+        && name.len() > 255
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "room_name exceeds 255 characters" })),
+        );
     }
 
     // Validate invite entries when allow_api_invite is enabled.
@@ -546,35 +548,36 @@ async fn handle_create_room_mapping(
     {
         Ok(Some(existing)) => {
             // If caller provided a specific matrix_room_id that differs, update it.
-            if let Some(ref wanted) = req.matrix_room_id {
-                if !wanted.is_empty() && wanted != &existing.matrix_room_id {
-                    match dispatcher
-                        .db()
-                        .create_room_mapping(wanted, &req.platform, &req.external_room_id)
-                        .await
-                    {
-                        Ok(id) => {
-                            info!(
-                                platform = req.platform,
-                                external = req.external_room_id,
-                                matrix = %wanted,
-                                "room mapping updated via API"
-                            );
-                            return (
-                                StatusCode::OK,
-                                Json(json!({
-                                    "id": id,
-                                    "matrix_room_id": wanted,
-                                })),
-                            );
-                        }
-                        Err(e) => {
-                            error!("update room mapping failed: {e}");
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({ "error": "internal error" })),
-                            );
-                        }
+            if let Some(ref wanted) = req.matrix_room_id
+                && !wanted.is_empty()
+                && wanted != &existing.matrix_room_id
+            {
+                match dispatcher
+                    .db()
+                    .create_room_mapping(wanted, &req.platform, &req.external_room_id)
+                    .await
+                {
+                    Ok(id) => {
+                        info!(
+                            platform = req.platform,
+                            external = req.external_room_id,
+                            matrix = %wanted,
+                            "room mapping updated via API"
+                        );
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": id,
+                                "matrix_room_id": wanted,
+                            })),
+                        );
+                    }
+                    Err(e) => {
+                        error!("update room mapping failed: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "internal error" })),
+                        );
                     }
                 }
             }
@@ -877,9 +880,7 @@ async fn handle_list_messages(
 ///   "puppets": [ ... ]
 /// }
 /// ```
-async fn handle_crypto_status(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_crypto_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(pool) = &state.crypto_pool else {
         return (
             StatusCode::OK,
@@ -957,9 +958,7 @@ async fn handle_crypto_status(
 ///   }
 /// }
 /// ```
-async fn handle_server_info(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_server_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let info = &state.bridge_info;
 
     let dispatcher = state.dispatcher.lock().await;
@@ -988,6 +987,7 @@ async fn handle_server_info(
                 "encryption_default": info.encryption_default,
                 "webhook_ssrf_protection": info.webhook_ssrf_protection,
                 "api_key_required": info.api_key_required,
+                "websocket_enabled": true,
             },
             "permissions": {
                 "invite_whitelist": info.invite_whitelist,
@@ -1001,6 +1001,7 @@ async fn handle_server_info(
                 "webhooks": webhooks,
                 "message_mappings": message_mappings,
                 "puppets": puppets,
+                "ws_clients": state.ws_registry.total_clients(),
             },
         })),
     )

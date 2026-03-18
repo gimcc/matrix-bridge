@@ -12,6 +12,7 @@ use matrix_bridge_store::Database;
 use crate::crypto_pool::CryptoManagerPool;
 use crate::matrix_client::MatrixClient;
 use crate::puppet_manager::PuppetManager;
+use crate::ws::WsRegistry;
 
 /// Routes events between Matrix and external platforms.
 ///
@@ -31,6 +32,8 @@ pub struct Dispatcher {
     puppet_user_prefix: String,
     /// Shared HTTP client for webhook delivery (reuses connection pool).
     http_client: reqwest::Client,
+    /// WebSocket client registry for real-time message delivery.
+    ws_registry: Arc<WsRegistry>,
     /// Optional crypto manager pool for encrypting outbound messages.
     crypto_pool: Option<Arc<CryptoManagerPool>>,
     /// Whether to auto-enable encryption for rooms on link.
@@ -40,6 +43,7 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         puppet_manager: Arc<PuppetManager>,
         matrix_client: MatrixClient,
@@ -48,6 +52,7 @@ impl Dispatcher {
         sender_localpart: &str,
         puppet_prefix: &str,
         permissions: PermissionsConfig,
+        ws_registry: Arc<WsRegistry>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -63,6 +68,7 @@ impl Dispatcher {
             puppet_prefix: puppet_prefix.to_string(),
             puppet_user_prefix: format!("@{puppet_prefix}_"),
             http_client,
+            ws_registry,
             crypto_pool: None,
             encryption_default: false,
             permissions,
@@ -156,21 +162,19 @@ impl Dispatcher {
         }
 
         // Track device keys for new joins/invites in encrypted rooms.
-        if membership == "join" || membership == "invite" {
-            if let Some(pool) = pool {
-                let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
-                if let Ok(ruma_room_id) = ruma_room_id
-                    && pool
-                        .bot()
-                        .is_room_encrypted(ruma_room_id, &self.matrix_client)
-                        .await
-                {
-                    if let Ok(user_id) = state_key.parse::<ruma::OwnedUserId>() {
-                        if let Err(e) = pool.bot().update_tracked_users(&[user_id]).await {
-                            warn!(room_id, state_key, "failed to track member devices: {e}");
-                        }
-                    }
-                }
+        if (membership == "join" || membership == "invite")
+            && let Some(pool) = pool
+        {
+            let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
+            if let Ok(ruma_room_id) = ruma_room_id
+                && pool
+                    .bot()
+                    .is_room_encrypted(ruma_room_id, &self.matrix_client)
+                    .await
+                && let Ok(user_id) = state_key.parse::<ruma::OwnedUserId>()
+                && let Err(e) = pool.bot().update_tracked_users(&[user_id]).await
+            {
+                warn!(room_id, state_key, "failed to track member devices: {e}");
             }
         }
 
@@ -214,18 +218,16 @@ impl Dispatcher {
         }
 
         // When the bot joins a room, track all room members' devices.
-        if is_bot {
-            if let Some(pool) = pool {
-                let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
-                if let Ok(ruma_room_id) = ruma_room_id
-                    && pool
-                        .bot()
-                        .is_room_encrypted(ruma_room_id, &self.matrix_client)
-                        .await
-                    && let Err(e) = self.update_tracked_users_pool(room_id, pool).await
-                {
-                    warn!(room_id, "failed to track users after bot join: {e}");
-                }
+        if is_bot && let Some(pool) = pool {
+            let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
+            if let Ok(ruma_room_id) = ruma_room_id
+                && pool
+                    .bot()
+                    .is_room_encrypted(ruma_room_id, &self.matrix_client)
+                    .await
+                && let Err(e) = self.update_tracked_users_pool(room_id, pool).await
+            {
+                warn!(room_id, "failed to track users after bot join: {e}");
             }
         }
 
@@ -252,10 +254,10 @@ impl Dispatcher {
         let bot_crypto = pool.bot();
 
         // Ensure the room is tracked as encrypted in our crypto store.
-        if !bot_crypto.is_room_encrypted_local(ruma_room_id).await {
-            if let Err(e) = bot_crypto.set_room_encrypted(ruma_room_id).await {
-                warn!(room_id, "failed to mark room as encrypted: {e}");
-            }
+        if !bot_crypto.is_room_encrypted_local(ruma_room_id).await
+            && let Err(e) = bot_crypto.set_room_encrypted(ruma_room_id).await
+        {
+            warn!(room_id, "failed to mark room as encrypted: {e}");
         }
 
         // Update tracked users to ensure we have device keys for all members.
@@ -534,12 +536,6 @@ impl Dispatcher {
         message: &BridgeMessage,
         source_platform: Option<&str>,
     ) -> anyhow::Result<()> {
-        let webhooks = self.db.list_webhooks(platform_id).await?;
-        if webhooks.is_empty() {
-            debug!(platform = platform_id, "no webhooks registered, skipping");
-            return Ok(());
-        }
-
         let mut payload = serde_json::json!({
             "event": "message",
             "platform": platform_id,
@@ -547,6 +543,20 @@ impl Dispatcher {
         });
         if let Some(src) = source_platform {
             payload["source_platform"] = serde_json::Value::String(src.to_string());
+        }
+
+        // Serialize once for both webhooks and WebSocket clients.
+        let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+
+        // Deliver to WebSocket clients (non-blocking, lock-free).
+        self.ws_registry
+            .broadcast(platform_id, &payload_str, source_platform);
+
+        // Deliver to HTTP webhooks.
+        let webhooks = self.db.list_webhooks(platform_id).await?;
+        if webhooks.is_empty() {
+            debug!(platform = platform_id, "no webhooks registered, skipping");
+            return Ok(());
         }
 
         for webhook in &webhooks {
@@ -819,14 +829,13 @@ impl Dispatcher {
                     .await?;
 
                 // Use per-user MatrixClient for sending if in per-user mode.
-                if pool.is_per_user() {
-                    if let Some(device_id) = pool.device_id_for_user(&sender_user_id).await {
-                        let puppet_client =
-                            self.matrix_client.with_user_device(as_user, &device_id);
-                        return puppet_client
-                            .send_encrypted_message(room_id, &encrypted, as_user, txn_id)
-                            .await;
-                    }
+                if pool.is_per_user()
+                    && let Some(device_id) = pool.device_id_for_user(&sender_user_id).await
+                {
+                    let puppet_client = self.matrix_client.with_user_device(as_user, &device_id);
+                    return puppet_client
+                        .send_encrypted_message(room_id, &encrypted, as_user, txn_id)
+                        .await;
                 }
 
                 return self

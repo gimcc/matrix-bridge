@@ -108,9 +108,8 @@ impl Database {
     /// List distinct platform IDs that have room mappings.
     pub async fn list_active_platforms(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT platform_id FROM room_mappings ORDER BY platform_id",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT platform_id FROM room_mappings ORDER BY platform_id")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         let mut platforms = Vec::new();
         for row in rows {

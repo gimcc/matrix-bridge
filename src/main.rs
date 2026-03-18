@@ -11,6 +11,7 @@ use matrix_bridge_appservice::dispatcher::Dispatcher;
 use matrix_bridge_appservice::matrix_client::MatrixClient;
 use matrix_bridge_appservice::puppet_manager::PuppetManager;
 use matrix_bridge_appservice::server::{self, AppState, BridgeInfo};
+use matrix_bridge_appservice::ws::WsRegistry;
 use matrix_bridge_core::config::AppConfig;
 use matrix_bridge_core::registration;
 use matrix_bridge_store::Database;
@@ -95,8 +96,7 @@ async fn main() -> anyhow::Result<()> {
     for user_id in &config.appservice.auto_invite {
         if !user_id.starts_with('@') || !user_id.contains(':') {
             anyhow::bail!(
-                "invalid auto_invite entry '{}': must be a valid Matrix user ID (start with '@' and contain ':')",
-                user_id
+                "invalid auto_invite entry '{user_id}': must be a valid Matrix user ID (start with '@' and contain ':')"
             );
         }
     }
@@ -284,6 +284,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Create WebSocket registry.
+    let ws_registry = Arc::new(WsRegistry::new());
+
     // Create dispatcher.
     let mut dispatcher = Dispatcher::new(
         puppet_manager,
@@ -293,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
         &config.appservice.sender_localpart,
         &config.appservice.puppet_prefix,
         config.permissions.clone(),
+        Arc::clone(&ws_registry),
     );
 
     // Wire up crypto pool to dispatcher for outbound encryption.
@@ -331,6 +335,8 @@ async fn main() -> anyhow::Result<()> {
         allow_api_invite: config.appservice.allow_api_invite,
         encryption_default: config.encryption.default,
         bridge_info,
+        ws_registry,
+        api_key: config.appservice.api_key.clone().filter(|k| !k.is_empty()),
     });
 
     // Start HTTP server.

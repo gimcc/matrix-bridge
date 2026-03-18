@@ -20,6 +20,7 @@ use crate::auth::{ApiKey, HsToken, verify_api_key, verify_hs_token};
 use crate::bridge_api;
 use crate::crypto_pool::CryptoManagerPool;
 use crate::dispatcher::Dispatcher;
+use crate::ws::{self, WsRegistry};
 
 /// Maximum number of transaction IDs to keep for deduplication.
 const MAX_PROCESSED_TXNS: usize = 10_000;
@@ -56,6 +57,10 @@ pub struct AppState {
     pub encryption_default: bool,
     /// Non-sensitive server info for the info API.
     pub bridge_info: BridgeInfo,
+    /// Registry of active WebSocket connections.
+    pub ws_registry: Arc<WsRegistry>,
+    /// Optional API key for the Bridge HTTP API (cached for WS auth).
+    pub api_key: Option<String>,
 }
 
 /// Build the axum Router for the appservice HTTP endpoints.
@@ -90,9 +95,13 @@ pub fn build_router(state: Arc<AppState>, hs_token: String, api_key: Option<Stri
         bridge_api::build_bridge_api_router()
     };
 
+    // WebSocket endpoint — authenticates via query param, not middleware.
+    let ws_route = Router::new().route("/api/v1/ws", get(ws::handle_ws_upgrade));
+
     // Merge all routes under one state.
     matrix_routes
         .merge(bridge_routes)
+        .merge(ws_route)
         .route("/health", get(handle_health))
         .with_state(state)
 }
@@ -364,6 +373,7 @@ fn parse_per_user_otk_counts(
 /// Supports two formats:
 /// - Per-user: `{ "@user:server": { "DEVICE": ["signed_curve25519"] } }`
 /// - Legacy flat: `["signed_curve25519"]`
+#[allow(clippy::type_complexity)]
 fn parse_per_user_fallback_keys(
     raw: &Option<Value>,
 ) -> (
@@ -391,11 +401,10 @@ fn parse_per_user_fallback_keys(
                 continue;
             };
             // Flatten per-device to per-user (take first device's types).
-            for (_device_id, types_val) in devices {
+            if let Some((_device_id, types_val)) = devices.into_iter().next() {
                 let types: Option<Vec<ruma::OneTimeKeyAlgorithm>> =
                     serde_json::from_value(types_val.clone()).ok();
                 per_user.insert(user_id.clone(), types);
-                break;
             }
         }
     }
@@ -422,13 +431,13 @@ fn parse_per_user_to_device(
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<OwnedUserId>().ok());
 
-        if let Some(user_id) = to_user {
-            if let Ok(raw_val) = serde_json::value::to_raw_value(event) {
-                result
-                    .entry(user_id)
-                    .or_default()
-                    .push(ruma::serde::Raw::from_json(raw_val));
-            }
+        if let Some(user_id) = to_user
+            && let Ok(raw_val) = serde_json::value::to_raw_value(event)
+        {
+            result
+                .entry(user_id)
+                .or_default()
+                .push(ruma::serde::Raw::from_json(raw_val));
         }
         // Events without to_user_id are dropped in per-user mode
         // (they shouldn't exist per MSC3202).
