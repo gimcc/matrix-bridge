@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::{
@@ -20,6 +21,18 @@ const CLIENT_CHANNEL_CAPACITY: usize = 64;
 /// Interval between server-sent ping frames.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Maximum total WebSocket connections across all platforms.
+const MAX_WS_CLIENTS: usize = 1000;
+
+/// Maximum length for a platform ID.
+const MAX_PLATFORM_ID_LEN: usize = 64;
+
+/// Maximum number of entries in `exclude_sources`.
+const MAX_EXCLUDE_SOURCES: usize = 20;
+
+/// Maximum length for each `exclude_sources` entry.
+const MAX_EXCLUDE_SOURCE_LEN: usize = 64;
+
 /// A connected WebSocket client.
 struct WsClient {
     id: String,
@@ -29,16 +42,19 @@ struct WsClient {
 
 /// Registry of active WebSocket connections, keyed by platform ID.
 ///
-/// Uses `DashMap` for lock-free concurrent access — safe to call from
-/// the Dispatcher while holding its own lock.
+/// Uses `DashMap` with per-shard locking for concurrent access — safe to
+/// call from the Dispatcher while holding its own lock.
 pub struct WsRegistry {
     clients: DashMap<String, Vec<WsClient>>,
+    /// Atomic counter for fast total_clients() without iterating the map.
+    count: AtomicUsize,
 }
 
 impl WsRegistry {
     pub fn new() -> Self {
         Self {
             clients: DashMap::new(),
+            count: AtomicUsize::new(0),
         }
     }
 
@@ -62,6 +78,7 @@ impl WsRegistry {
             .entry(platform_id.to_string())
             .or_default()
             .push(client);
+        self.count.fetch_add(1, Ordering::Relaxed);
 
         (id, rx)
     }
@@ -69,7 +86,12 @@ impl WsRegistry {
     /// Remove a client from the registry.
     fn unregister(&self, platform_id: &str, client_id: &str) {
         if let Some(mut entry) = self.clients.get_mut(platform_id) {
+            let before = entry.len();
             entry.retain(|c| c.id != client_id);
+            let removed = before - entry.len();
+            if removed > 0 {
+                self.count.fetch_sub(removed, Ordering::Relaxed);
+            }
             if entry.is_empty() {
                 drop(entry);
                 self.clients.remove(platform_id);
@@ -110,13 +132,15 @@ impl WsRegistry {
         }
 
         if !closed_ids.is_empty() {
+            let removed = closed_ids.len();
             entry.retain(|c| !closed_ids.contains(&c.id));
+            self.count.fetch_sub(removed, Ordering::Relaxed);
         }
     }
 
     /// Total number of connected WebSocket clients across all platforms.
     pub fn total_clients(&self) -> usize {
-        self.clients.iter().map(|e| e.value().len()).sum()
+        self.count.load(Ordering::Relaxed)
     }
 }
 
@@ -131,6 +155,14 @@ pub struct WsConnectParams {
     pub exclude_sources: Option<String>,
 }
 
+/// Validate that a platform ID contains only allowed characters and is bounded.
+fn is_valid_platform_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_PLATFORM_ID_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
 /// GET /api/v1/ws?platform=xxx&access_token=yyy&exclude_sources=a,b
 ///
 /// Upgrades the HTTP connection to a WebSocket for real-time message delivery.
@@ -139,8 +171,18 @@ pub async fn handle_ws_upgrade(
     Query(params): Query<WsConnectParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    if params.platform.is_empty() {
-        return (StatusCode::BAD_REQUEST, "missing platform parameter").into_response();
+    // Validate platform parameter.
+    if !is_valid_platform_id(&params.platform) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid platform: must be 1-64 alphanumeric/dash/underscore/dot characters",
+        )
+            .into_response();
+    }
+
+    // Enforce global connection limit.
+    if state.ws_registry.total_clients() >= MAX_WS_CLIENTS {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many ws connections").into_response();
     }
 
     // Authenticate if api_key is configured.
@@ -159,7 +201,8 @@ pub async fn handle_ws_upgrade(
         .unwrap_or("")
         .split(',')
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s.len() <= MAX_EXCLUDE_SOURCE_LEN)
+        .take(MAX_EXCLUDE_SOURCES)
         .collect();
 
     ws.on_upgrade(move |socket| handle_ws_session(state, platform, exclude_sources, socket))
@@ -192,7 +235,7 @@ async fn handle_ws_session(
     // Outbound: registry → client (messages + periodic ping).
     let platform_clone = platform.clone();
     let client_id_clone = client_id.clone();
-    let outbound = tokio::spawn(async move {
+    let mut outbound = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -224,7 +267,7 @@ async fn handle_ws_session(
     });
 
     // Inbound: client → server (only handle Close/Pong, ignore others).
-    let inbound = tokio::spawn(async move {
+    let mut inbound = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 Message::Close(_) => break,
@@ -233,10 +276,10 @@ async fn handle_ws_session(
         }
     });
 
-    // Wait for either task to finish, then clean up.
+    // Wait for either task to finish, then abort the other to prevent leaks.
     tokio::select! {
-        _ = outbound => {}
-        _ = inbound => {}
+        _ = &mut outbound => { inbound.abort(); }
+        _ = &mut inbound => { outbound.abort(); }
     }
 
     state.ws_registry.unregister(&platform, &client_id);
@@ -315,5 +358,28 @@ mod tests {
         assert_eq!(registry.total_clients(), 0);
         // Idempotent unregister should not panic.
         registry.unregister("test", &id);
+    }
+
+    #[test]
+    fn test_valid_platform_id() {
+        assert!(is_valid_platform_id("telegram"));
+        assert!(is_valid_platform_id("my-app_v2"));
+        assert!(is_valid_platform_id("a.b.c"));
+        assert!(!is_valid_platform_id(""));
+        assert!(!is_valid_platform_id("has space"));
+        assert!(!is_valid_platform_id("has/slash"));
+        assert!(!is_valid_platform_id(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn test_total_clients_atomic_counter() {
+        let registry = WsRegistry::new();
+        let (_id1, _rx1) = registry.register("a", vec![]);
+        let (_id2, _rx2) = registry.register("b", vec![]);
+        let (id3, _rx3) = registry.register("a", vec![]);
+        assert_eq!(registry.total_clients(), 3);
+
+        registry.unregister("a", &id3);
+        assert_eq!(registry.total_clients(), 2);
     }
 }
