@@ -33,6 +33,9 @@ const MAX_FORWARD_SOURCES: usize = 20;
 /// Maximum length for each `forward_sources` entry.
 const MAX_FORWARD_SOURCE_LEN: usize = 64;
 
+/// Timeout for the client to send the auth message after connecting.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A connected WebSocket client.
 struct WsClient {
     id: String,
@@ -180,15 +183,24 @@ impl WsRegistry {
 }
 
 /// Query parameters for the WebSocket upgrade request.
+///
+/// Authentication is NOT done via query params to avoid leaking tokens in
+/// server/proxy logs. Instead, when `api_key` is configured the client must
+/// send `{"access_token":"<key>"}` as the first WebSocket message after
+/// connecting (within [`AUTH_TIMEOUT`]).
 #[derive(Debug, Deserialize)]
 pub struct WsConnectParams {
     /// Platform ID to subscribe to (required).
     pub platform: String,
-    /// API key for authentication (required if `api_key` is configured).
-    pub access_token: Option<String>,
     /// Comma-separated allowlist of source platform IDs to forward.
     /// Empty = deny all (default), "*" = forward all.
     pub forward_sources: Option<String>,
+}
+
+/// First message the client must send when `api_key` is configured.
+#[derive(Debug, Deserialize)]
+struct WsAuthMessage {
+    access_token: String,
 }
 
 /// Validate that a platform ID contains only allowed characters and is bounded.
@@ -199,10 +211,20 @@ fn is_valid_platform_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
 }
 
-/// Validate WebSocket connection parameters and authenticate.
+/// Parse `forward_sources` from a comma-separated string.
+fn parse_forward_sources(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() <= MAX_FORWARD_SOURCE_LEN)
+        .take(MAX_FORWARD_SOURCES)
+        .collect()
+}
+
+/// Validate WebSocket connection parameters (pre-upgrade, no auth check).
 ///
 /// Returns `Ok((platform, forward_sources))` on success, or `Err((status, message))`
-/// on validation/auth failure. Extracted for testability without a real TCP connection.
+/// on validation failure. Auth is handled post-upgrade via the first message.
 fn validate_ws_params(
     params: &WsConnectParams,
     state: &AppState,
@@ -218,31 +240,20 @@ fn validate_ws_params(
         return Err((StatusCode::TOO_MANY_REQUESTS, "too many ws connections"));
     }
 
-    if let Some(ref expected) = state.api_key {
-        match &params.access_token {
-            Some(token) if auth::verify_token(token, expected) => {}
-            Some(_) => return Err((StatusCode::FORBIDDEN, "invalid access_token")),
-            None => return Err((StatusCode::UNAUTHORIZED, "missing access_token")),
-        }
-    }
-
     let platform = params.platform.clone();
-    let forward_sources: Vec<String> = params
-        .forward_sources
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.len() <= MAX_FORWARD_SOURCE_LEN)
-        .take(MAX_FORWARD_SOURCES)
-        .collect();
+    let forward_sources = parse_forward_sources(params.forward_sources.as_deref());
 
     Ok((platform, forward_sources))
 }
 
-/// GET /api/v1/ws?platform=xxx&access_token=yyy&forward_sources=*
+/// GET /api/v1/ws?platform=xxx&forward_sources=*
 ///
 /// Upgrades the HTTP connection to a WebSocket for real-time message delivery.
+///
+/// When `api_key` is configured, the client must send a JSON auth message
+/// as the first frame after connecting: `{"access_token":"<key>"}`.
+/// The server will close the connection if the token is missing, invalid,
+/// or not received within [`AUTH_TIMEOUT`].
 pub async fn handle_ws_upgrade(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WsConnectParams>,
@@ -256,7 +267,8 @@ pub async fn handle_ws_upgrade(
     ws.on_upgrade(move |socket| handle_ws_session(state, platform, forward_sources, socket))
 }
 
-/// Run a WebSocket session: forward messages from the registry to the client,
+/// Run a WebSocket session: authenticate via first message (if needed),
+/// then forward messages from the registry to the client,
 /// and handle pings/close from the client side.
 async fn handle_ws_session(
     state: Arc<AppState>,
@@ -264,6 +276,50 @@ async fn handle_ws_session(
     forward_sources: Vec<String>,
     socket: axum::extract::ws::WebSocket,
 ) {
+    use futures_util::SinkExt;
+    use futures_util::StreamExt;
+
+    let (mut sink, mut stream) = socket.split();
+
+    // --- Authentication via first message ---
+    if let Some(ref expected) = state.api_key {
+        let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
+            while let Some(Ok(msg)) = stream.next().await {
+                match msg {
+                    Message::Text(text) => {
+                        return serde_json::from_str::<WsAuthMessage>(&text)
+                            .ok()
+                            .filter(|m| auth::verify_token(&m.access_token, expected))
+                            .is_some();
+                    }
+                    Message::Close(_) => return false,
+                    // Skip ping/pong/binary frames while waiting for auth.
+                    _ => continue,
+                }
+            }
+            false // stream ended without auth
+        })
+        .await;
+
+        let authenticated = matches!(auth_result, Ok(true));
+        if !authenticated {
+            let reason = if auth_result.is_err() {
+                "auth timeout"
+            } else {
+                "invalid or missing access_token"
+            };
+            warn!(platform, reason, "ws auth failed, closing connection");
+            let _ = sink
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 4001,
+                    reason: reason.into(),
+                })))
+                .await;
+            return;
+        }
+    }
+
+    // --- Authenticated: register and start message relay ---
     let (client_id, mut rx) = state.ws_registry.register(&platform, forward_sources);
 
     info!(
@@ -273,12 +329,7 @@ async fn handle_ws_session(
         "ws client connected"
     );
 
-    let (mut sink, mut stream) = socket.split();
-
-    use futures_util::SinkExt;
-    use futures_util::StreamExt;
-
-    // Outbound: registry → client (messages + periodic ping).
+    // Outbound: registry -> client (messages + periodic ping).
     let platform_clone = platform.clone();
     let client_id_clone = client_id.clone();
     let mut outbound = tokio::spawn(async move {
@@ -312,7 +363,7 @@ async fn handle_ws_session(
         );
     });
 
-    // Inbound: client → server (only handle Close/Pong, ignore others).
+    // Inbound: client -> server (only handle Close/Pong, ignore others).
     let mut inbound = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             if let Message::Close(_) = msg {
@@ -377,11 +428,11 @@ mod tests {
     #[test]
     fn test_broadcast_forward_sources() {
         let registry = WsRegistry::new();
-        // Client 1: only forwards "slack" → should NOT receive "matrix"
+        // Client 1: only forwards "slack" -> should NOT receive "matrix"
         let (_id1, mut rx1) = registry.register("telegram", vec!["slack".to_string()]);
-        // Client 2: forwards all → should receive "matrix"
+        // Client 2: forwards all -> should receive "matrix"
         let (_id2, mut rx2) = registry.register("telegram", vec!["*".to_string()]);
-        // Client 3: empty forward_sources → should NOT receive anything
+        // Client 3: empty forward_sources -> should NOT receive anything
         let (_id3, mut rx3) = registry.register("telegram", vec![]);
 
         registry.broadcast("telegram", r#"{"event":"message"}"#, Some("matrix"));
@@ -397,7 +448,7 @@ mod tests {
         let (_id1, mut rx1) = registry.register("telegram", vec!["matrix".to_string()]);
         let (_id2, mut rx2) = registry.register("telegram", vec!["slack".to_string()]);
 
-        // No source_platform → treated as "matrix"
+        // No source_platform -> treated as "matrix"
         registry.broadcast("telegram", r#"{"event":"message"}"#, None);
 
         assert!(rx1.try_recv().is_ok()); // "matrix" in allowlist
@@ -462,11 +513,28 @@ mod tests {
         assert_eq!(registry.total_clients(), 0);
     }
 
+    #[test]
+    fn test_parse_forward_sources() {
+        assert_eq!(parse_forward_sources(None), Vec::<String>::new());
+        assert_eq!(parse_forward_sources(Some("")), Vec::<String>::new());
+        assert_eq!(
+            parse_forward_sources(Some("matrix, slack")),
+            vec!["matrix", "slack"]
+        );
+        assert_eq!(parse_forward_sources(Some("*")), vec!["*"]);
+
+        // Oversized entries are filtered out.
+        let long = "x".repeat(MAX_FORWARD_SOURCE_LEN + 1);
+        let input = format!("ok,,{long},valid");
+        assert_eq!(parse_forward_sources(Some(&input)), vec!["ok", "valid"]);
+    }
+
     // --- Validation tests ---
     //
     // Test the `validate_ws_params` function directly, which covers the
-    // 400/401/403/429 rejection logic without needing a real TCP/WebSocket
+    // 400/429 rejection logic without needing a real TCP/WebSocket
     // connection (axum's `WebSocketUpgrade` extractor requires one).
+    // Auth is now handled post-upgrade via the first message.
 
     mod validation_tests {
         use super::*;
@@ -515,14 +583,9 @@ mod tests {
             }
         }
 
-        fn params(
-            platform: &str,
-            token: Option<&str>,
-            forward: Option<&str>,
-        ) -> WsConnectParams {
+        fn params(platform: &str, forward: Option<&str>) -> WsConnectParams {
             WsConnectParams {
                 platform: platform.to_string(),
-                access_token: token.map(|s| s.to_string()),
                 forward_sources: forward.map(|s| s.to_string()),
             }
         }
@@ -530,38 +593,15 @@ mod tests {
         #[test]
         fn rejects_invalid_platform() {
             let state = test_state(None, Arc::new(WsRegistry::new()));
-            let result = validate_ws_params(&params("has space", None, None), &state);
+            let result = validate_ws_params(&params("has space", None), &state);
             assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
         }
 
         #[test]
         fn rejects_empty_platform() {
             let state = test_state(None, Arc::new(WsRegistry::new()));
-            let result = validate_ws_params(&params("", None, None), &state);
+            let result = validate_ws_params(&params("", None), &state);
             assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
-        }
-
-        #[test]
-        fn rejects_missing_token_when_required() {
-            let state = test_state(Some("secret123".to_string()), Arc::new(WsRegistry::new()));
-            let result = validate_ws_params(&params("telegram", None, None), &state);
-            assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
-        }
-
-        #[test]
-        fn rejects_invalid_token() {
-            let state = test_state(Some("secret123".to_string()), Arc::new(WsRegistry::new()));
-            let result = validate_ws_params(&params("telegram", Some("wrong"), None), &state);
-            assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
-        }
-
-        #[test]
-        fn accepts_valid_token() {
-            let state = test_state(Some("secret123".to_string()), Arc::new(WsRegistry::new()));
-            let result =
-                validate_ws_params(&params("telegram", Some("secret123"), None), &state);
-            let (platform, _) = result.unwrap();
-            assert_eq!(platform, "telegram");
         }
 
         #[test]
@@ -575,36 +615,25 @@ mod tests {
                 .collect();
 
             let state = test_state(None, registry);
-            let result = validate_ws_params(&params("telegram", None, None), &state);
+            let result = validate_ws_params(&params("telegram", None), &state);
             assert_eq!(result.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
         }
 
         #[test]
-        fn allows_unauthenticated_when_no_api_key() {
+        fn accepts_valid_params() {
             let state = test_state(None, Arc::new(WsRegistry::new()));
-            let result = validate_ws_params(&params("telegram", None, None), &state);
+            let result = validate_ws_params(&params("telegram", Some("*")), &state);
             let (platform, fwd) = result.unwrap();
             assert_eq!(platform, "telegram");
+            assert_eq!(fwd, vec!["*"]);
+        }
+
+        #[test]
+        fn empty_forward_sources_by_default() {
+            let state = test_state(None, Arc::new(WsRegistry::new()));
+            let result = validate_ws_params(&params("telegram", None), &state);
+            let (_, fwd) = result.unwrap();
             assert!(fwd.is_empty());
-        }
-
-        #[test]
-        fn parses_forward_sources() {
-            let state = test_state(None, Arc::new(WsRegistry::new()));
-            let result =
-                validate_ws_params(&params("telegram", None, Some("matrix, slack")), &state);
-            let (_, fwd) = result.unwrap();
-            assert_eq!(fwd, vec!["matrix", "slack"]);
-        }
-
-        #[test]
-        fn filters_empty_and_oversized_forward_sources() {
-            let state = test_state(None, Arc::new(WsRegistry::new()));
-            let long = "x".repeat(MAX_FORWARD_SOURCE_LEN + 1);
-            let input = format!("ok,,{long},valid");
-            let result = validate_ws_params(&params("telegram", None, Some(&input)), &state);
-            let (_, fwd) = result.unwrap();
-            assert_eq!(fwd, vec!["ok", "valid"]);
         }
     }
 }

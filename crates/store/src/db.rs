@@ -58,12 +58,17 @@ impl Database {
                 .query_row([], |row| row.get::<_, i64>(0))
                 .map(|count| count > 0)?;
             if has_old {
-                // Rename old column: drop and recreate (SQLite doesn't support RENAME COLUMN on older versions).
+                // Preserve old "no exclusions" (allow all) as forward_sources="*".
+                // Rows that had explicit exclusions become deny-all (operator must reconfigure).
+                conn.execute_batch(
+                    "UPDATE webhooks SET exclude_sources = '*' WHERE exclude_sources = ''",
+                )?;
+                conn.execute_batch(
+                    "UPDATE webhooks SET exclude_sources = '' WHERE exclude_sources != '*'",
+                )?;
                 conn.execute_batch(
                     "ALTER TABLE webhooks RENAME COLUMN exclude_sources TO forward_sources",
                 )?;
-                // Reset all values — old blacklist semantics don't carry over.
-                conn.execute_batch("UPDATE webhooks SET forward_sources = ''")?;
             }
 
             let has_new: bool = conn
