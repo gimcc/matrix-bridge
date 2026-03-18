@@ -26,22 +26,39 @@ All encryption operations use a single `OlmMachine` instance for the bridge bot 
   └─────────┘        └──────────┘
 ```
 
-### Future Consideration: Per-User Crypto
+### Per-User Crypto (Optional)
 
-An alternative approach (used by [matrix-bot-sdk](https://github.com/turt2live/matrix-bot-sdk)) gives each puppet its own `OlmMachine` with independent device keys. This eliminates the MSC dependency and improves client compatibility, but significantly increases complexity.
+Each puppet can have its own `OlmMachine` with independent device keys. Enable with `per_user_crypto = true` in config. This eliminates the MismatchedSender warning and improves client compatibility.
+
+```
+┌─────────────────────────────────────────────┐
+│            CryptoManagerPool                │
+│                                             │
+│  bot: Arc<CryptoManager>  (always init)     │
+│  puppets: HashMap<UserId, Arc<CryptoMgr>>   │
+│           (lazily initialized)              │
+│                                             │
+│  to-device routing:                         │
+│    txn.to_user_id → lookup OlmMachine       │
+│    → receive_sync_changes per machine       │
+│                                             │
+│  encrypt: puppet's own OlmMachine           │
+│  decrypt: bot's OlmMachine (always in room) │
+└─────────────────────────────────────────────┘
+```
 
 **Trade-offs:**
 
-| | Single Device (current) | Per-User Crypto |
+| | Single Device (default) | Per-User Crypto |
 |---|---|---|
-| OlmMachine instances | 1 | 1 per active puppet |
-| Crypto stores | 1 SQLite DB | 1 per puppet (lazy init) |
-| MSC dependency | MSC3202/MSC4190 required | Standard E2EE model |
-| Client compatibility | Some clients may not share keys with unknown devices | All clients work normally |
+| Config | `per_user_crypto = false` | `per_user_crypto = true` |
+| OlmMachine instances | 1 | 1 per active puppet (lazy) |
+| Crypto stores | 1 SQLite DB | `{crypto_store}/puppets/{localpart}/` per puppet |
+| MSC dependency | MSC3202/MSC4190 for masquerading | MSC3202 for to-device routing |
+| Client compatibility | MismatchedSender warning | All clients work normally |
 | to-device routing | All events go to bridge bot | Routed by `to_user_id` |
-| OTK management | Single pool | Per-user pools |
-
-**Decision:** Deferred. Testing the current single-device approach first. If clients fail to share Megolm keys with the bridge bot's device, per-user crypto becomes necessary.
+| OTK management | Single pool | Per-user pools from MSC3202 transaction |
+| Device ID | Configured `device_id` | `{puppet_device_prefix}_{sha256(localpart)[0:16]}` |
 
 ## Encryption Flow
 

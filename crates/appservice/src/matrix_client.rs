@@ -60,6 +60,25 @@ impl MatrixClient {
         self.bot_user_id = Some(format!("@{}:{}", sender_localpart, self.server_name));
     }
 
+    /// Create a clone of this MatrixClient that acts on behalf of a specific puppet user/device.
+    /// E2EE endpoints (keys/upload, keys/query, keys/claim, sendToDevice) will carry
+    /// the puppet's `user_id` and `device_id` instead of the bridge bot's.
+    pub fn with_user_device(&self, user_id: &str, device_id: &str) -> Self {
+        Self {
+            client: self.client.clone(),
+            homeserver_url: self.homeserver_url.clone(),
+            as_token: self.as_token.clone(),
+            server_name: self.server_name.clone(),
+            device_id: Some(device_id.to_string()),
+            bot_user_id: Some(user_id.to_string()),
+        }
+    }
+
+    /// Get the server name.
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
     /// Convert a reqwest Response into an http::Response<Vec<u8>> for ruma deserialization.
     ///
     /// Logs a warning for non-2xx responses to aid E2EE debugging.
@@ -658,6 +677,80 @@ impl MatrixClient {
         } else {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("get room encryption state failed: {text}");
+        }
+    }
+
+    /// Upload cross-signing keys (master, self-signing, user-signing).
+    ///
+    /// Corresponds to `POST /_matrix/client/v3/keys/device_signing/upload`.
+    /// Appservice requests typically bypass UIA, so `auth` is not sent.
+    pub async fn upload_signing_keys(
+        &self,
+        master_key: Option<&Value>,
+        self_signing_key: Option<&Value>,
+        user_signing_key: Option<&Value>,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/_matrix/client/v3/keys/device_signing/upload",
+            self.homeserver_url
+        );
+
+        let mut body = json!({});
+        if let Some(k) = master_key {
+            body["master_key"] = k.clone();
+        }
+        if let Some(k) = self_signing_key {
+            body["self_signing_key"] = k.clone();
+        }
+        if let Some(k) = user_signing_key {
+            body["user_signing_key"] = k.clone();
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .query(&self.e2ee_query_params())
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            debug!("cross-signing keys uploaded");
+            Ok(())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("upload signing keys failed: {text}");
+        }
+    }
+
+    /// Upload cross-signing signatures (device key signatures, etc.).
+    ///
+    /// Corresponds to `POST /_matrix/client/v3/keys/signatures/upload`.
+    pub async fn upload_signatures(
+        &self,
+        signed_keys: &Value,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/_matrix/client/v3/keys/signatures/upload",
+            self.homeserver_url
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .query(&self.e2ee_query_params())
+            .json(signed_keys)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            debug!("signatures uploaded");
+            Ok(())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("upload signatures failed: {text}");
         }
     }
 

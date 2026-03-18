@@ -43,6 +43,13 @@ pub struct EncryptionConfig {
     /// Device ID for the bridge bot. Must be alphanumeric/underscore (no spaces).
     #[serde(default = "default_device_id")]
     pub device_id: String,
+    /// Enable per-user crypto: each puppet gets its own OlmMachine and device keys.
+    /// When false (default), all puppets share the bridge bot's single device (MSC3202 masquerading).
+    #[serde(default)]
+    pub per_user_crypto: bool,
+    /// Prefix for generating deterministic puppet device IDs (per-user crypto mode).
+    #[serde(default = "default_puppet_device_prefix")]
+    pub puppet_device_prefix: String,
 }
 
 impl Default for EncryptionConfig {
@@ -55,6 +62,8 @@ impl Default for EncryptionConfig {
             crypto_store_passphrase: None,
             device_display_name: default_device_name(),
             device_id: default_device_id(),
+            per_user_crypto: false,
+            puppet_device_prefix: default_puppet_device_prefix(),
         }
     }
 }
@@ -73,6 +82,10 @@ fn default_device_name() -> String {
 
 fn default_device_id() -> String {
     "matrix_bridge".to_string()
+}
+
+fn default_puppet_device_prefix() -> String {
+    "puppet".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

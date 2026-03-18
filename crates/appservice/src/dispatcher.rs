@@ -9,7 +9,7 @@ use matrix_bridge_core::message::{BridgeMessage, ExternalRoom, ExternalUser, Mes
 use matrix_bridge_core::platform;
 use matrix_bridge_store::Database;
 
-use crate::crypto_manager::CryptoManager;
+use crate::crypto_pool::CryptoManagerPool;
 use crate::matrix_client::MatrixClient;
 use crate::puppet_manager::PuppetManager;
 
@@ -31,8 +31,8 @@ pub struct Dispatcher {
     puppet_user_prefix: String,
     /// Shared HTTP client for webhook delivery (reuses connection pool).
     http_client: reqwest::Client,
-    /// Optional crypto manager for encrypting outbound messages.
-    crypto: Option<Arc<CryptoManager>>,
+    /// Optional crypto manager pool for encrypting outbound messages.
+    crypto_pool: Option<Arc<CryptoManagerPool>>,
     /// Whether to auto-enable encryption for rooms on link.
     encryption_default: bool,
     /// Permission settings (invite whitelist, etc.).
@@ -63,22 +63,22 @@ impl Dispatcher {
             puppet_prefix: puppet_prefix.to_string(),
             puppet_user_prefix: format!("@{puppet_prefix}_"),
             http_client,
-            crypto: None,
+            crypto_pool: None,
             encryption_default: false,
             permissions,
         }
     }
 
-    /// Set the crypto manager for E2BE encryption.
-    pub fn set_crypto(&mut self, crypto: Arc<CryptoManager>, encryption_default: bool) {
-        self.crypto = Some(crypto);
+    /// Set the crypto manager pool for E2BE encryption.
+    pub fn set_crypto(&mut self, pool: Arc<CryptoManagerPool>, encryption_default: bool) {
+        self.crypto_pool = Some(pool);
         self.encryption_default = encryption_default;
     }
 
     /// Handle a batch of events from the homeserver transaction endpoint.
-    pub async fn handle_transaction(&self, events: &[Value], crypto: Option<&CryptoManager>) {
+    pub async fn handle_transaction(&self, events: &[Value], pool: Option<&CryptoManagerPool>) {
         for event in events {
-            if let Err(e) = self.handle_event(event, crypto).await {
+            if let Err(e) = self.handle_event(event, pool).await {
                 error!("failed to handle event: {e}");
             }
         }
@@ -88,7 +88,7 @@ impl Dispatcher {
     async fn handle_event(
         &self,
         event: &Value,
-        crypto: Option<&CryptoManager>,
+        pool: Option<&CryptoManagerPool>,
     ) -> anyhow::Result<()> {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let room_id = event.get("room_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -97,7 +97,7 @@ impl Dispatcher {
         // m.room.member events must be processed even when sent by the bot
         // itself (e.g. self-invite), so check membership before the bot skip.
         if event_type == "m.room.member" {
-            return self.handle_membership(room_id, event, crypto).await;
+            return self.handle_membership(room_id, event, pool).await;
         }
 
         // Skip events from the bridge bot itself (not puppet users — those need
@@ -109,18 +109,16 @@ impl Dispatcher {
         match event_type {
             "m.room.message" => self.handle_room_message(room_id, sender, event).await,
             "m.room.encrypted" => {
-                self.handle_encrypted_event(room_id, sender, event, crypto)
+                self.handle_encrypted_event(room_id, sender, event, pool)
                     .await
             }
             "m.room.encryption" => {
                 // Track that this room is now encrypted and query member device keys.
-                // Like matrix-bot-sdk's RoomTracker.onRoomEvent + addTrackedUsers for
-                // all room members on m.room.encryption events.
-                if let Some(crypto) = crypto {
+                if let Some(pool) = pool {
                     let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
-                    crypto.set_room_encrypted(ruma_room_id).await?;
+                    pool.bot().set_room_encrypted(ruma_room_id).await?;
                     // Track all room members' devices (not just the sender).
-                    if let Err(e) = self.update_tracked_users(room_id, crypto).await {
+                    if let Err(e) = self.update_tracked_users_pool(room_id, pool).await {
                         warn!(room_id, "failed to track users on encryption event: {e}");
                     }
                 }
@@ -140,7 +138,7 @@ impl Dispatcher {
         &self,
         room_id: &str,
         event: &Value,
-        crypto: Option<&CryptoManager>,
+        pool: Option<&CryptoManagerPool>,
     ) -> anyhow::Result<()> {
         let membership = event
             .get("content")
@@ -157,16 +155,15 @@ impl Dispatcher {
             return Ok(());
         }
 
-        // Track device keys for new joins/invites in encrypted rooms
-        // (like matrix-bot-sdk's CryptoClient.onRoomEvent for m.room.member).
+        // Track device keys for new joins/invites in encrypted rooms.
         if membership == "join" || membership == "invite" {
-            if let Some(crypto) = crypto {
+            if let Some(pool) = pool {
                 let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
                 if let Ok(ruma_room_id) = ruma_room_id
-                    && crypto.is_room_encrypted(ruma_room_id, &self.matrix_client).await
+                    && pool.bot().is_room_encrypted(ruma_room_id, &self.matrix_client).await
                 {
                     if let Ok(user_id) = state_key.parse::<ruma::OwnedUserId>() {
-                        if let Err(e) = crypto.update_tracked_users(&[user_id]).await {
+                        if let Err(e) = pool.bot().update_tracked_users(&[user_id]).await {
                             warn!(room_id, state_key, "failed to track member devices: {e}");
                         }
                     }
@@ -215,11 +212,11 @@ impl Dispatcher {
 
         // When the bot joins a room, track all room members' devices.
         if is_bot {
-            if let Some(crypto) = crypto {
+            if let Some(pool) = pool {
                 let ruma_room_id: Result<&ruma::RoomId, _> = room_id.try_into();
                 if let Ok(ruma_room_id) = ruma_room_id
-                    && crypto.is_room_encrypted(ruma_room_id, &self.matrix_client).await
-                    && let Err(e) = self.update_tracked_users(room_id, crypto).await
+                    && pool.bot().is_room_encrypted(ruma_room_id, &self.matrix_client).await
+                    && let Err(e) = self.update_tracked_users_pool(room_id, pool).await
                 {
                     warn!(room_id, "failed to track users after bot join: {e}");
                 }
@@ -238,24 +235,25 @@ impl Dispatcher {
         room_id: &str,
         sender: &str,
         event: &Value,
-        crypto: Option<&CryptoManager>,
+        pool: Option<&CryptoManagerPool>,
     ) -> anyhow::Result<()> {
-        let Some(crypto) = crypto else {
+        let Some(pool) = pool else {
             debug!(room_id, "received encrypted event but E2EE is not enabled");
             return Ok(());
         };
 
         let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
+        let bot_crypto = pool.bot();
 
         // Ensure the room is tracked as encrypted in our crypto store.
-        if !crypto.is_room_encrypted_local(ruma_room_id).await {
-            if let Err(e) = crypto.set_room_encrypted(ruma_room_id).await {
+        if !bot_crypto.is_room_encrypted_local(ruma_room_id).await {
+            if let Err(e) = bot_crypto.set_room_encrypted(ruma_room_id).await {
                 warn!(room_id, "failed to mark room as encrypted: {e}");
             }
         }
 
         // Update tracked users to ensure we have device keys for all members.
-        if let Err(e) = self.update_tracked_users(room_id, crypto).await {
+        if let Err(e) = self.update_tracked_users_pool(room_id, pool).await {
             warn!(
                 room_id,
                 "failed to update tracked users before decrypt: {e}"
@@ -264,13 +262,12 @@ impl Dispatcher {
 
         let event_id = event.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Attempt decryption.
-        let decrypted = match crypto.decrypt(ruma_room_id, event).await {
+        // Attempt decryption (bot's OlmMachine, which should have Megolm session keys).
+        let decrypted = match pool.decrypt(ruma_room_id, event).await {
             Ok(d) => d,
             Err(e) => {
-                // Process any outgoing key requests generated by the failed decrypt
-                // (e.g., key request to-device messages).
-                if let Err(e2) = crypto.process_outgoing_requests().await {
+                // Process any outgoing key requests generated by the failed decrypt.
+                if let Err(e2) = bot_crypto.process_outgoing_requests().await {
                     warn!(room_id, "failed to process key requests after decrypt failure: {e2}");
                 }
 
@@ -756,32 +753,32 @@ impl Dispatcher {
     /// Enable encryption on a room and register it with the crypto manager.
     pub async fn enable_room_encryption(&self, room_id: &str) -> anyhow::Result<()> {
         self.matrix_client.enable_room_encryption(room_id).await?;
-        if let Some(crypto) = &self.crypto {
+        if let Some(pool) = &self.crypto_pool {
             let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
-            crypto.set_room_encrypted(ruma_room_id).await?;
+            pool.bot().set_room_encrypted(ruma_room_id).await?;
         }
         Ok(())
     }
 
-    /// Query device keys for all members of a room.
-    async fn update_tracked_users(
+    /// Query device keys for all members of a room using CryptoManagerPool.
+    async fn update_tracked_users_pool(
         &self,
         room_id: &str,
-        crypto: &CryptoManager,
+        pool: &CryptoManagerPool,
     ) -> anyhow::Result<()> {
         let members_str = self.matrix_client.get_room_members(room_id).await?;
         let members: Vec<ruma::OwnedUserId> =
             members_str.iter().filter_map(|m| m.parse().ok()).collect();
         if !members.is_empty() {
-            crypto.update_tracked_users(&members).await?;
+            pool.bot().update_tracked_users(&members).await?;
         }
         Ok(())
     }
 
     /// Send a message to a Matrix room, encrypting if the room has encryption enabled.
     ///
-    /// Queries the server for room encryption state to handle rooms that were
-    /// encrypted after the bridge started (like matrix-bot-sdk's RoomTracker).
+    /// In per-user crypto mode, the puppet's own OlmMachine is used for encryption
+    /// and the puppet's device_id is sent in the request.
     async fn send_to_matrix(
         &self,
         room_id: &str,
@@ -789,16 +786,28 @@ impl Dispatcher {
         as_user: &str,
         txn_id: &str,
     ) -> anyhow::Result<String> {
-        if let Some(crypto) = &self.crypto {
+        if let Some(pool) = &self.crypto_pool {
             let ruma_room_id: &ruma::RoomId = room_id.try_into()?;
-            if crypto.is_room_encrypted(ruma_room_id, &self.matrix_client).await {
+            if pool.bot().is_room_encrypted(ruma_room_id, &self.matrix_client).await {
                 let members_str = self.matrix_client.get_room_members(room_id).await?;
                 let members: Vec<ruma::OwnedUserId> =
                     members_str.iter().filter_map(|m| m.parse().ok()).collect();
 
-                let encrypted = crypto
-                    .encrypt(ruma_room_id, "m.room.message", content, &members)
+                // In per-user mode, use the puppet's own OlmMachine.
+                let sender_user_id: ruma::OwnedUserId = as_user.parse()?;
+                let encrypted = pool
+                    .encrypt(&sender_user_id, ruma_room_id, "m.room.message", content, &members)
                     .await?;
+
+                // Use per-user MatrixClient for sending if in per-user mode.
+                if pool.is_per_user() {
+                    if let Some(device_id) = pool.device_id_for_user(&sender_user_id).await {
+                        let puppet_client = self.matrix_client.with_user_device(as_user, &device_id);
+                        return puppet_client
+                            .send_encrypted_message(room_id, &encrypted, as_user, txn_id)
+                            .await;
+                    }
+                }
 
                 return self
                     .matrix_client
@@ -857,8 +866,8 @@ impl Dispatcher {
                     warn!(room_id, "failed to auto-enable encryption: {e}");
                 }
 
-                if let Some(crypto) = &self.crypto
-                    && let Err(e) = self.update_tracked_users(room_id, crypto).await
+                if let Some(pool) = &self.crypto_pool
+                    && let Err(e) = self.update_tracked_users_pool(room_id, pool).await
                 {
                     warn!(room_id, "failed to update tracked users: {e}");
                 }
@@ -942,9 +951,9 @@ impl Dispatcher {
                     })?;
 
                 if self.encryption_default
-                    && let Some(crypto) = &self.crypto
+                    && let Some(pool) = &self.crypto_pool
                     && let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(matrix_room_id.as_str())
-                    && let Err(e) = crypto.set_room_encrypted(ruma_room_id).await
+                    && let Err(e) = pool.bot().set_room_encrypted(ruma_room_id).await
                 {
                     warn!(
                         %matrix_room_id,

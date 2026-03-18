@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use matrix_bridge_appservice::crypto_manager::CryptoManager;
+use matrix_bridge_appservice::crypto_pool::CryptoManagerPool;
 use matrix_bridge_appservice::dispatcher::Dispatcher;
 use matrix_bridge_appservice::matrix_client::MatrixClient;
 use matrix_bridge_appservice::puppet_manager::PuppetManager;
@@ -122,8 +123,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Create puppet manager (pass device_id so puppets get the bridge device for MSC4326).
-    let puppet_device_id = if config.encryption.allow {
+    // Create puppet manager.
+    // In per-user crypto mode, puppets get their own devices (managed by CryptoManagerPool),
+    // so we don't pass the bridge bot's device_id.
+    // In single-device mode, puppets share the bridge bot's device for MSC3202 masquerading.
+    let puppet_device_id = if config.encryption.allow && !config.encryption.per_user_crypto {
         Some(config.encryption.device_id.clone())
     } else {
         None
@@ -243,8 +247,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Initialize CryptoManager if encryption is enabled.
-    let crypto_manager = if config.encryption.allow {
+    // Initialize CryptoManagerPool if encryption is enabled.
+    let crypto_pool = if config.encryption.allow {
         let bot_user_id: ruma::OwnedUserId = format!(
             "@{}:{}",
             config.appservice.sender_localpart, config.homeserver.domain
@@ -263,9 +267,23 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| "failed to initialize crypto manager")?;
 
-        info!("end-to-bridge encryption enabled");
+        let pool = CryptoManagerPool::new(
+            Arc::new(cm),
+            matrix_client.clone(),
+            &config.encryption.crypto_store,
+            config.encryption.crypto_store_passphrase.as_deref(),
+            &config.encryption.puppet_device_prefix,
+            config.encryption.per_user_crypto,
+            &config.appservice.puppet_prefix,
+        );
 
-        Some(Arc::new(cm))
+        if config.encryption.per_user_crypto {
+            info!("end-to-bridge encryption enabled (per-user crypto mode)");
+        } else {
+            info!("end-to-bridge encryption enabled (single-device mode)");
+        }
+
+        Some(Arc::new(pool))
     } else {
         None
     };
@@ -281,16 +299,16 @@ async fn main() -> anyhow::Result<()> {
         config.permissions.clone(),
     );
 
-    // Wire up crypto manager to dispatcher for outbound encryption.
-    if let Some(ref cm) = crypto_manager {
-        dispatcher.set_crypto(Arc::clone(cm), config.encryption.default);
+    // Wire up crypto pool to dispatcher for outbound encryption.
+    if let Some(ref pool) = crypto_pool {
+        dispatcher.set_crypto(Arc::clone(pool), config.encryption.default);
     }
 
     // Build app state.
     let state = Arc::new(AppState {
         dispatcher: Arc::new(Mutex::new(dispatcher)),
         processed_txns: Mutex::new(indexmap::IndexSet::new()),
-        crypto_manager,
+        crypto_pool,
         webhook_ssrf_protection: config.appservice.webhook_ssrf_protection,
         auto_invite: config.appservice.auto_invite.clone(),
         allow_api_invite: config.appservice.allow_api_invite,

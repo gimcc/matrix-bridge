@@ -2,13 +2,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use matrix_sdk_crypto::{
-    DecryptionSettings, EncryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
-    store::types::RoomSettings, types::EventEncryptionAlgorithm,
-    types::requests::AnyOutgoingRequest,
+    CrossSigningBootstrapRequests, DecryptionSettings, EncryptionSettings, EncryptionSyncChanges,
+    OlmMachine, TrustRequirement, store::types::RoomSettings,
+    types::EventEncryptionAlgorithm,
+    types::requests::{AnyIncomingResponse, AnyOutgoingRequest},
 };
 use matrix_sdk_sqlite::SqliteCryptoStore;
 use ruma::{
-    OneTimeKeyAlgorithm, OwnedUserId, RoomId, UInt, UserId,
+    OneTimeKeyAlgorithm, OwnedDeviceId, OwnedUserId, RoomId, UInt, UserId,
     api::client::sync::sync_events::DeviceLists, events::AnyToDeviceEvent, serde::Raw,
 };
 use serde_json::Value;
@@ -94,7 +95,74 @@ impl CryptoManager {
             debug!("device keys verified on server");
         }
 
+        // Bootstrap cross-signing if not already done.
+        // This creates MSK/SSK/USK, uploads them, and signs our device key
+        // with the self-signing key so clients see the device as verified.
+        if let Err(e) = cm.bootstrap_cross_signing(false).await {
+            warn!("cross-signing bootstrap failed (non-fatal): {e}");
+        }
+
         Ok(cm)
+    }
+
+    /// Initialize a crypto manager for a puppet user (per-user crypto mode).
+    ///
+    /// Unlike `new()`, this uses a per-puppet subdirectory for the crypto store
+    /// and does not attempt the "device keys on server" rebuild loop.
+    /// The `matrix_client` should be a per-user clone from `with_user_device()`.
+    pub async fn new_for_puppet(
+        user_id: &UserId,
+        device_id: &ruma::DeviceId,
+        base_store_path: &str,
+        passphrase: Option<&str>,
+        matrix_client: MatrixClient,
+    ) -> anyhow::Result<Self> {
+        if passphrase.is_none() || passphrase == Some("") {
+            anyhow::bail!(
+                "encryption.crypto_store_passphrase must be set for puppet crypto stores. \
+                 Without a passphrase, Olm/Megolm keys are stored unencrypted on disk."
+            );
+        }
+
+        // Per-puppet store under base_store_path/puppets/{hash}/
+        // Uses SHA-256 of the localpart as directory name to prevent path traversal
+        // (localparts can contain '/' and '..' per the Matrix spec).
+        let localpart = user_id.localpart();
+        let dir_name = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(localpart.as_bytes());
+            hash[..16].iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let store_path = Path::new(base_store_path).join("puppets").join(dir_name);
+        std::fs::create_dir_all(&store_path)?;
+
+        let cm = Self::open(user_id, device_id, &store_path, passphrase, matrix_client).await?;
+
+        // Upload device keys and OTKs.
+        cm.process_outgoing_requests().await?;
+
+        info!(
+            user_id = %user_id,
+            device_id = %device_id,
+            "puppet crypto manager initialized"
+        );
+
+        Ok(cm)
+    }
+
+    /// Generate a deterministic device ID for a puppet user.
+    ///
+    /// Uses `{prefix}_{sha256(localpart)[0..8] as hex}` to stay under the 64-char
+    /// limit and remain stable across Rust toolchain upgrades (SHA-256 output is
+    /// guaranteed stable, unlike `DefaultHasher`).
+    pub fn puppet_device_id(user_id: &UserId, prefix: &str) -> OwnedDeviceId {
+        use sha2::{Digest, Sha256};
+        let localpart = user_id.localpart();
+        let hash = Sha256::digest(localpart.as_bytes());
+        // 8 bytes = 16 hex chars, 64 bits of collision resistance.
+        let hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let device_id_str = format!("{prefix}_{hex}");
+        device_id_str.into()
     }
 
     /// Open or create the crypto store and build an OlmMachine.
@@ -222,6 +290,15 @@ impl CryptoManager {
                 self.machine
                     .mark_request_as_sent(request_id, &resp)
                     .await?;
+            }
+            AnyOutgoingRequest::SignatureUpload(req) => {
+                let signed_keys_json = serde_json::to_value(&req.signed_keys)?;
+                self.matrix_client.upload_signatures(&signed_keys_json).await?;
+                let resp = ruma::api::client::keys::upload_signatures::v3::Response::new();
+                self.machine
+                    .mark_request_as_sent(request_id, &resp)
+                    .await?;
+                info!("cross-signing signatures uploaded via outgoing request");
             }
             _ => {
                 debug!("unhandled outgoing request type");
@@ -526,6 +603,106 @@ impl CryptoManager {
         self.claim_missing_sessions(user_ids).await?;
 
         debug!(count = user_ids.len(), "tracked users updated");
+        Ok(())
+    }
+
+    /// Bootstrap cross-signing keys (master, self-signing, user-signing).
+    ///
+    /// Generates the cross-signing identity, uploads the signing keys to the
+    /// homeserver, and uploads device key signatures so that the device is
+    /// verified by its owner's self-signing key.
+    ///
+    /// If cross-signing is already set up (`reset = false`), re-uploads the
+    /// existing identity and re-signs the current device.
+    pub async fn bootstrap_cross_signing(&self, reset: bool) -> anyhow::Result<()> {
+        let status = self.machine.cross_signing_status().await;
+        let has_master = status.has_master;
+        let has_self_signing = status.has_self_signing;
+        let has_user_signing = status.has_user_signing;
+
+        info!(
+            has_master,
+            has_self_signing,
+            has_user_signing,
+            reset,
+            "cross-signing status before bootstrap"
+        );
+
+        let CrossSigningBootstrapRequests {
+            upload_keys_req,
+            upload_signing_keys_req,
+            upload_signatures_req,
+        } = self.machine.bootstrap_cross_signing(reset).await?;
+
+        // Step 1: Upload device keys if needed (fresh account).
+        if let Some(req) = upload_keys_req {
+            self.dispatch_outgoing_request(req.request_id(), req.request()).await?;
+            info!("cross-signing: device keys uploaded");
+        }
+
+        // Step 2: Upload cross-signing public keys to
+        // POST /_matrix/client/v3/keys/device_signing/upload
+        {
+            let master_json = upload_signing_keys_req
+                .master_key
+                .as_ref()
+                .map(|k| serde_json::to_value(k))
+                .transpose()?;
+            let self_signing_json = upload_signing_keys_req
+                .self_signing_key
+                .as_ref()
+                .map(|k| serde_json::to_value(k))
+                .transpose()?;
+            let user_signing_json = upload_signing_keys_req
+                .user_signing_key
+                .as_ref()
+                .map(|k| serde_json::to_value(k))
+                .transpose()?;
+
+            self.matrix_client
+                .upload_signing_keys(
+                    master_json.as_ref(),
+                    self_signing_json.as_ref(),
+                    user_signing_json.as_ref(),
+                )
+                .await?;
+
+            // Notify OlmMachine that signing keys were uploaded.
+            // SigningKeysUploadResponse has no From impl for AnyIncomingResponse,
+            // so we construct it directly.
+            let resp = ruma::api::client::keys::upload_signing_keys::v3::Response::new();
+            self.machine
+                .mark_request_as_sent(
+                    &ruma::TransactionId::new(),
+                    AnyIncomingResponse::SigningKeysUpload(&resp),
+                )
+                .await?;
+
+            info!("cross-signing: signing keys uploaded");
+        }
+
+        // Step 3: Upload signatures (self-signing key signs device keys).
+        // POST /_matrix/client/v3/keys/signatures/upload
+        {
+            let signed_keys_json = serde_json::to_value(&upload_signatures_req.signed_keys)?;
+            self.matrix_client
+                .upload_signatures(&signed_keys_json)
+                .await?;
+
+            let resp = ruma::api::client::keys::upload_signatures::v3::Response::new();
+            self.machine
+                .mark_request_as_sent(&ruma::TransactionId::new(), &resp)
+                .await?;
+
+            info!("cross-signing: device signatures uploaded");
+        }
+
+        info!(
+            user_id = %self.machine.user_id(),
+            device_id = %self.machine.device_id(),
+            "cross-signing bootstrap complete"
+        );
+
         Ok(())
     }
 

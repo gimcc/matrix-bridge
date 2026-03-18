@@ -459,16 +459,16 @@ async fn auto_create_room(
     // Register encryption state and track member devices so
     // other clients share Megolm session keys with the bridge.
     if state.encryption_default {
-        if let Some(crypto) = &state.crypto_manager {
+        if let Some(pool) = &state.crypto_pool {
             if let Ok(ruma_room_id) = <&ruma::RoomId>::try_from(id.as_str()) {
-                if let Err(e) = crypto.set_room_encrypted(ruma_room_id).await {
+                if let Err(e) = pool.bot().set_room_encrypted(ruma_room_id).await {
                     error!(room_id = %id, "failed to mark room as encrypted: {e}");
                 }
                 // Query device keys for invited members.
                 let members: Vec<ruma::OwnedUserId> =
                     invite.iter().filter_map(|u| u.parse().ok()).collect();
                 if !members.is_empty() {
-                    if let Err(e) = crypto.update_tracked_users(&members).await {
+                    if let Err(e) = pool.bot().update_tracked_users(&members).await {
                         error!(room_id = %id, "failed to track user devices: {e}");
                     }
                 }
