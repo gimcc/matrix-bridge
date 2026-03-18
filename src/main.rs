@@ -96,8 +96,7 @@ async fn main() -> anyhow::Result<()> {
     for user_id in &config.appservice.auto_invite {
         if !user_id.starts_with('@') || !user_id.contains(':') {
             anyhow::bail!(
-                "invalid auto_invite entry '{}': must be a valid Matrix user ID (start with '@' and contain ':')",
-                user_id
+                "invalid auto_invite entry '{user_id}': must be a valid Matrix user ID (start with '@' and contain ':')"
             );
         }
     }
