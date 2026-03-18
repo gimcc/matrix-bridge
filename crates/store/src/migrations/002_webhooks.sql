@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
     secret TEXT,
     events TEXT NOT NULL DEFAULT 'message',
     enabled INTEGER NOT NULL DEFAULT 1,
+    forward_sources TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(platform_id, webhook_url)
 );
