@@ -56,6 +56,7 @@ function broadcast(msg: ChatMessage): void {
   console.log(`[broadcast] pushing to ${sseClients.size} SSE client(s)`);
   const payload = `data: ${JSON.stringify(msg)}\n\n`;
   for (const client of sseClients) {
+    if (!client.alive) continue;
     try {
       client.ctrl.write(payload);
       client.ctrl.flush();
@@ -63,6 +64,7 @@ function broadcast(msg: ChatMessage): void {
       console.log("[broadcast] write failed, removing client");
       client.alive = false;
       sseClients.delete(client);
+      try { client.ctrl.close(); } catch { /* already closed */ }
     }
   }
 }
@@ -134,33 +136,38 @@ function handleSSE(req: Request): Response {
       controller.flush();
       console.log(`[sse] client connected (${sseClients.size} total)`);
 
-      // Send a heartbeat comment every 15s to keep the connection alive
+      function cleanup() {
+        if (!client.alive) return;
+        client.alive = false;
+        clearInterval(heartbeat);
+        sseClients.delete(client);
+        console.log(`[sse] client disconnected (${sseClients.size} total)`);
+        try { controller.close(); } catch { /* already closed */ }
+      }
+
+      // Send a heartbeat comment every 10s to keep the connection alive
       // through proxies and prevent browser idle timeouts.
       const heartbeat = setInterval(() => {
         try {
-          client.ctrl.write(": heartbeat\n\n");
-          client.ctrl.flush();
+          controller.write(": heartbeat\n\n");
+          controller.flush();
+          console.log(`[sse] heartbeat sent (${sseClients.size} client(s))`);
         } catch {
-          client.alive = false;
+          cleanup();
         }
-      }, 15_000);
+      }, 10_000);
 
       // Detect client disconnect via the request's AbortSignal.
-      req.signal.addEventListener("abort", () => {
-        client.alive = false;
-      });
+      req.signal.addEventListener("abort", () => cleanup());
 
       // Keep the stream open until the client disconnects.
       return new Promise<void>((resolve) => {
         const check = setInterval(() => {
           if (!client.alive) {
             clearInterval(check);
-            clearInterval(heartbeat);
-            sseClients.delete(client);
-            console.log(`[sse] client disconnected (${sseClients.size} total)`);
             resolve();
           }
-        }, 2000);
+        }, 1000);
       });
     },
   });
@@ -170,6 +177,7 @@ function handleSSE(req: Request): Response {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   });
 }
@@ -372,6 +380,7 @@ document.getElementById("compose").addEventListener("submit", async (e) => {
 
 Bun.serve({
   port: PORT,
+  idleTimeout: 255, // max allowed; prevents Bun from killing SSE connections
   async fetch(req) {
     const url = new URL(req.url);
 
