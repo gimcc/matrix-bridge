@@ -390,44 +390,21 @@ impl CryptoManager {
         // state between preparation and encryption.
         let _guard = self.lock.write().await;
 
-        info!(
+        debug!(
             room_id = %room_id,
             member_count = room_members.len(),
-            members = ?room_members.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
             "encrypt: starting preparation"
         );
 
         // Step 1: Ensure all room members are tracked.
+        // OlmMachine internally marks new users as needing a key query; for
+        // already-tracked users it is a no-op.  Device key freshness is
+        // maintained via device_lists.changed in receive_sync_changes().
         let refs: Vec<&UserId> = room_members.iter().map(|u| u.as_ref()).collect();
         self.machine.update_tracked_users(refs).await?;
 
-        // Step 2: Force a fresh device key query for all room members.
-        // `update_tracked_users` is a no-op for already-tracked users, so we
-        // use `query_keys_for_users` which always generates a new KeysQuery
-        // regardless of tracking state.  This ensures we have up-to-date
-        // device information even after bridge restarts or missed device-list
-        // change notifications.
-        {
-            let (txn_id, keys_query_req) = self.machine.query_keys_for_users(
-                room_members.iter().map(|u| u.as_ref()),
-            );
-            let queried_users: Vec<String> = keys_query_req.device_keys.keys()
-                .map(|u| u.to_string())
-                .collect();
-            info!(users = ?queried_users, "encrypt: forced keys query for room members");
-            let resp = self.matrix_client.query_keys_raw(&keys_query_req).await?;
-            for (user_id, devices) in &resp.device_keys {
-                info!(
-                    user_id = %user_id,
-                    device_count = devices.len(),
-                    device_ids = ?devices.keys().map(|d| d.to_string()).collect::<Vec<_>>(),
-                    "encrypt: got devices"
-                );
-            }
-            self.machine.mark_request_as_sent(&txn_id, &resp).await?;
-        }
-
-        // Process any other pending outgoing requests (key uploads, etc.).
+        // Step 2: Process pending outgoing requests (key uploads, key queries
+        // for newly-tracked users, etc.) in a single batch.
         self.process_outgoing_requests().await?;
 
         // Step 3: Claim missing Olm sessions for room members.
@@ -443,27 +420,13 @@ impl CryptoManager {
             )
             .await?;
 
-        info!(
+        debug!(
             room_id = %room_id,
             to_device_requests = requests.len(),
             "encrypt: sharing room key"
         );
 
         for request in &requests {
-            // Log which users/devices we're sending keys to.
-            let recipient_count: usize = request.messages.values()
-                .map(|devices| devices.len())
-                .sum();
-            let recipients: Vec<String> = request.messages.keys()
-                .map(|u| u.to_string())
-                .collect();
-            info!(
-                room_id = %room_id,
-                event_type = %request.event_type,
-                recipients = recipient_count,
-                recipient_users = ?recipients,
-                "encrypt: sending to-device key share"
-            );
             let resp = self.matrix_client.send_to_device_raw(request).await?;
             self.machine
                 .mark_request_as_sent(&request.txn_id, &resp)
@@ -479,19 +442,16 @@ impl CryptoManager {
             .encrypt_room_event_raw(room_id, event_type, &raw_typed)
             .await?;
 
-        // Process any remaining outgoing requests (e.g., key uploads).
-        self.process_outgoing_requests().await?;
+        // NOTE: We skip process_outgoing_requests() here.
+        // The transaction-level flush in server.rs handles any remaining
+        // outgoing requests (key uploads, etc.) after all events are processed.
 
         let encrypted_value: Value = serde_json::from_str(encrypted.json().get())?;
 
-        // Log key fields from encrypted content for debugging.
-        info!(
+        debug!(
             room_id = %room_id,
             session_id = encrypted_value.get("session_id").and_then(|v| v.as_str()).unwrap_or("?"),
-            has_sender_key = encrypted_value.get("sender_key").is_some(),
-            has_device_id = encrypted_value.get("device_id").is_some(),
-            algorithm = encrypted_value.get("algorithm").and_then(|v| v.as_str()).unwrap_or("?"),
-            "encrypt: message encrypted successfully"
+            "encrypt: done"
         );
 
         Ok(encrypted_value)
