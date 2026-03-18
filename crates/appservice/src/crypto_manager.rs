@@ -675,6 +675,54 @@ impl CryptoManager {
     pub fn user_id(&self) -> &UserId {
         self.machine.user_id()
     }
+
+    /// Query encryption status: cross-signing state and device keys from server.
+    ///
+    /// Returns `(cross_signing_status, server_device_info)` where device info
+    /// includes algorithms, identity keys (curve25519/ed25519), and signatures.
+    pub async fn crypto_status(&self) -> anyhow::Result<CryptoStatus> {
+        let cross_signing = self.machine.cross_signing_status().await;
+
+        // Query homeserver for our device keys (includes OTK counts in practice,
+        // but the keys/query response gives us the uploaded device key details).
+        let user_id = self.machine.user_id().to_owned();
+        let device_id = self.machine.device_id().to_owned();
+        let req = matrix_sdk_crypto::types::requests::KeysQueryRequest {
+            device_keys: BTreeMap::from([(user_id.clone(), Vec::new())]),
+            timeout: Some(std::time::Duration::from_secs(10)),
+        };
+        let resp = self.matrix_client.query_keys_raw(&req).await?;
+
+        let device_info = resp
+            .device_keys
+            .get(&user_id)
+            .and_then(|devices| devices.get(&device_id))
+            .map(|raw| serde_json::to_value(raw).unwrap_or_default());
+
+        Ok(CryptoStatus {
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            has_master_key: cross_signing.has_master,
+            has_self_signing_key: cross_signing.has_self_signing,
+            has_user_signing_key: cross_signing.has_user_signing,
+            device_keys_uploaded: device_info.is_some(),
+            device_keys: device_info,
+        })
+    }
+}
+
+/// Encryption status for a single crypto device (bot or puppet).
+#[derive(Debug, serde::Serialize)]
+pub struct CryptoStatus {
+    pub user_id: String,
+    pub device_id: String,
+    pub has_master_key: bool,
+    pub has_self_signing_key: bool,
+    pub has_user_signing_key: bool,
+    pub device_keys_uploaded: bool,
+    /// Raw device keys from the homeserver (algorithms, keys, signatures).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_keys: Option<Value>,
 }
 
 /// Result of decrypting an event.

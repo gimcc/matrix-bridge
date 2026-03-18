@@ -11,6 +11,7 @@ use axum::{
 };
 use indexmap::IndexSet;
 use ruma::OwnedUserId;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
@@ -22,6 +23,21 @@ use crate::dispatcher::Dispatcher;
 
 /// Maximum number of transaction IDs to keep for deduplication.
 const MAX_PROCESSED_TXNS: usize = 10_000;
+
+/// Non-sensitive server configuration exposed via the info API.
+#[derive(Debug, Clone, Serialize)]
+pub struct BridgeInfo {
+    pub homeserver_url: String,
+    pub homeserver_domain: String,
+    pub bot_user_id: String,
+    pub puppet_prefix: String,
+    pub encryption_enabled: bool,
+    pub encryption_default: bool,
+    pub webhook_ssrf_protection: bool,
+    pub api_key_required: bool,
+    pub configured_platforms: Vec<String>,
+    pub invite_whitelist: Vec<String>,
+}
 
 /// Shared application state for the axum server.
 pub struct AppState {
@@ -38,13 +54,15 @@ pub struct AppState {
     pub allow_api_invite: bool,
     /// Whether to auto-enable encryption for newly created rooms.
     pub encryption_default: bool,
+    /// Non-sensitive server info for the info API.
+    pub bridge_info: BridgeInfo,
 }
 
 /// Build the axum Router for the appservice HTTP endpoints.
 ///
 /// - `hs_token`: Matrix protocol shared secret (Synapse ↔ appservice). Always
 ///   required on `/_matrix/app/v1/*` routes.
-/// - `api_key`: optional API key for the Bridge HTTP API (`/api/v1/*`). When
+/// - `api_key`: optional API key for the Bridge HTTP API (`/api/v1/admin/*`). When
 ///   `Some`, every Bridge API request must carry this key. When `None`, the
 ///   Bridge API is unauthenticated — suitable for internal/trusted-network
 ///   deployments where access control is handled externally.

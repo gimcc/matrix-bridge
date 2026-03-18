@@ -61,6 +61,52 @@ impl Database {
         }
     }
 
+    /// List all puppet users.
+    pub async fn list_all_puppets(&self) -> anyhow::Result<Vec<Puppet>> {
+        let conn = self.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, matrix_user_id, platform_id, external_user_id, display_name, avatar_mxc FROM puppets",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Puppet {
+                id: row.get(0)?,
+                matrix_user_id: row.get(1)?,
+                platform_id: row.get(2)?,
+                external_user_id: row.get(3)?,
+                display_name: row.get(4)?,
+                avatar_mxc: row.get(5)?,
+            })
+        })?;
+        let mut puppets = Vec::new();
+        for row in rows {
+            puppets.push(row?);
+        }
+        Ok(puppets)
+    }
+
+    /// List puppet users for a given platform.
+    pub async fn list_puppets(&self, platform_id: &str) -> anyhow::Result<Vec<Puppet>> {
+        let conn = self.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, matrix_user_id, platform_id, external_user_id, display_name, avatar_mxc FROM puppets WHERE platform_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![platform_id], |row| {
+            Ok(Puppet {
+                id: row.get(0)?,
+                matrix_user_id: row.get(1)?,
+                platform_id: row.get(2)?,
+                external_user_id: row.get(3)?,
+                display_name: row.get(4)?,
+                avatar_mxc: row.get(5)?,
+            })
+        })?;
+        let mut puppets = Vec::new();
+        for row in rows {
+            puppets.push(row?);
+        }
+        Ok(puppets)
+    }
+
     /// Find a puppet by external platform user ID.
     pub async fn find_puppet_by_external_id(
         &self,

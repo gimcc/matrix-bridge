@@ -8,11 +8,11 @@ All request/response bodies are JSON unless otherwise noted.
 
 ## Authentication
 
-The Bridge API (`/api/v1/*`) supports optional API key authentication, configured separately from the Matrix `hs_token`.
+The Bridge API (`/api/v1/admin/*`) supports optional API key authentication, configured separately from the Matrix `hs_token`.
 
 | Config Field | Default | Description |
 |---|---|---|
-| `appservice.api_key` | _(empty)_ | When set, all `/api/v1/*` requests require this key |
+| `appservice.api_key` | _(empty)_ | When set, all `/api/v1/admin/*` requests require this key |
 
 When `api_key` is configured, include it in every request via one of:
 
@@ -23,7 +23,7 @@ Authorization: Bearer <api_key>
 or as a query parameter:
 
 ```
-GET /api/v1/rooms?platform=myapp&access_token=<api_key>
+GET /api/v1/admin/rooms?platform=myapp&access_token=<api_key>
 ```
 
 When `api_key` is not set (default), the Bridge API requires no authentication. This is suitable for internal/trusted-network deployments where access control is handled at the network level (firewall, reverse proxy, etc.).
@@ -36,10 +36,14 @@ When `api_key` is not set (default), the Bridge API requires no authentication. 
 
 - [Authentication](#authentication)
 - [Health Check](#health-check)
+- [Server Info](#server-info)
+- [Encryption Status](#encryption-status)
 - [Send Inbound Message](#send-inbound-message)
 - [Upload Media](#upload-media)
 - [Room Mappings](#room-mappings)
 - [Webhooks](#webhooks)
+- [Puppet Users](#puppet-users)
+- [Message Mappings](#message-mappings)
 - [Webhook Callback Format](#webhook-callback-format-outbound)
 - [SSRF Protection](#ssrf-protection)
 - [Content Types](#content-types)
@@ -63,10 +67,130 @@ GET /health
 
 ---
 
+## Server Info
+
+```
+GET /api/v1/admin/info
+```
+
+Returns server configuration, feature flags, and runtime statistics.
+
+**Response `200`**
+
+```json
+{
+  "version": "0.1.0",
+  "homeserver": {
+    "url": "https://matrix.example.com",
+    "domain": "example.com"
+  },
+  "bot": {
+    "user_id": "@bridge_bot:example.com",
+    "puppet_prefix": "bot"
+  },
+  "features": {
+    "encryption_enabled": true,
+    "encryption_default": true,
+    "webhook_ssrf_protection": false,
+    "api_key_required": true
+  },
+  "permissions": {
+    "invite_whitelist": ["@admin:example.com"]
+  },
+  "platforms": {
+    "configured": ["telegram", "slack"],
+    "active": ["telegram"]
+  },
+  "stats": {
+    "room_mappings": 5,
+    "webhooks": 3,
+    "message_mappings": 1024,
+    "puppets": 42
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `platforms.configured` | Platforms defined in config |
+| `platforms.active` | Platforms with at least one room mapping |
+| `stats.*` | Row counts from the database |
+
+---
+
+## Encryption Status
+
+```
+GET /api/v1/admin/crypto
+```
+
+Returns encryption key status for the bridge bot and all initialized puppet crypto devices. Queries the homeserver for actual device key state.
+
+**Response `200` (encryption enabled)**
+
+```json
+{
+  "enabled": true,
+  "per_user_crypto": true,
+  "bot": {
+    "user_id": "@bridge_bot:example.com",
+    "device_id": "BRIDGE_DEV",
+    "has_master_key": true,
+    "has_self_signing_key": true,
+    "has_user_signing_key": true,
+    "device_keys_uploaded": true,
+    "device_keys": {
+      "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+      "keys": {
+        "curve25519:BRIDGE_DEV": "...",
+        "ed25519:BRIDGE_DEV": "..."
+      },
+      "signatures": { "..." : { "..." : "..." } }
+    }
+  },
+  "puppets": [
+    {
+      "user_id": "@telegram_user123:example.com",
+      "device_id": "PUP_abc123",
+      "has_master_key": true,
+      "has_self_signing_key": true,
+      "has_user_signing_key": true,
+      "device_keys_uploaded": true,
+      "device_keys": { "..." }
+    }
+  ]
+}
+```
+
+**Response `200` (encryption disabled)**
+
+```json
+{
+  "enabled": false,
+  "per_user_crypto": false,
+  "bot": null,
+  "puppets": []
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Whether E2EE is enabled in config |
+| `per_user_crypto` | Whether per-user crypto mode is active (each puppet gets its own OlmMachine) |
+| `bot` | Bridge bot's crypto status |
+| `puppets` | Array of initialized puppet crypto statuses |
+| `has_master_key` | Cross-signing master key exists in local store |
+| `has_self_signing_key` | Cross-signing self-signing key exists |
+| `has_user_signing_key` | Cross-signing user-signing key exists |
+| `device_keys_uploaded` | Whether device keys are present on the homeserver |
+| `device_keys` | Raw device key object from the homeserver (algorithms, identity keys, signatures) |
+
+---
+
 ## Send Inbound Message
 
 ```
-POST /api/v1/message
+POST /api/v1/admin/message
 ```
 
 Sends a message from an external platform into Matrix. The bridge creates a puppet user for the sender and delivers the message to the mapped Matrix room.
@@ -131,7 +255,7 @@ The puppet user created from this request would be `@telegram_user789:<homeserve
 ## Upload Media
 
 ```
-POST /api/v1/upload
+POST /api/v1/admin/upload
 ```
 
 Uploads a file to the Matrix content repository. Use the returned `content_uri` in message content fields (e.g. `url` for image/file/video/audio types).
@@ -143,7 +267,7 @@ Uploads a file to the Matrix content repository. Use the returned `content_uri` 
 Multipart form-data with a single `file` field.
 
 ```bash
-curl -X POST http://localhost:29320/api/v1/upload \
+curl -X POST http://localhost:29320/api/v1/admin/upload \
   -F "file=@photo.jpg"
 ```
 
@@ -166,10 +290,22 @@ Room mappings link an external platform room to a Matrix room. Messages are only
 ### Create Room Mapping
 
 ```
-POST /api/v1/rooms
+POST /api/v1/admin/rooms
 ```
 
+Idempotent: if a mapping for `(platform, external_room_id)` already exists, returns the existing mapping (`200`). Otherwise creates a new one (`201`). When `matrix_room_id` is omitted, the bridge auto-creates a new Matrix room.
+
 **Request Body**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `platform` | string | Yes | Platform identifier |
+| `external_room_id` | string | Yes | Room ID on the external platform |
+| `matrix_room_id` | string | No | Specific Matrix room ID; omit to auto-create |
+| `room_name` | string | No | Room name for auto-creation (max 255 chars; ignored if `matrix_room_id` is provided) |
+| `invite` | array | No | Extra Matrix user IDs to invite on auto-creation (max 50; requires `allow_api_invite = true` in config) |
+
+**Example (explicit room)**
 
 ```json
 {
@@ -179,23 +315,44 @@ POST /api/v1/rooms
 }
 ```
 
-**Response `201`**
+**Example (auto-create)**
 
 ```json
 {
-  "id": 1
+  "platform": "telegram",
+  "external_room_id": "chat_123",
+  "room_name": "Telegram Chat",
+  "invite": ["@admin:example.com"]
+}
+```
+
+**Response `201`** (created)
+
+```json
+{
+  "id": 1,
+  "matrix_room_id": "!abc:example.com"
+}
+```
+
+**Response `200`** (existing mapping returned)
+
+```json
+{
+  "id": 1,
+  "matrix_room_id": "!abc:example.com"
 }
 ```
 
 ### List Room Mappings
 
 ```
-GET /api/v1/rooms?platform=telegram
+GET /api/v1/admin/rooms?platform=telegram
 ```
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `platform` | Yes | Filter by platform identifier |
+| `platform` | No | Filter by platform; omit to list all mappings |
 
 **Response `200`**
 
@@ -204,7 +361,7 @@ GET /api/v1/rooms?platform=telegram
   "rooms": [
     {
       "id": 1,
-      "platform": "telegram",
+      "platform_id": "telegram",
       "external_room_id": "chat_123",
       "matrix_room_id": "!abc:example.com"
     }
@@ -215,7 +372,7 @@ GET /api/v1/rooms?platform=telegram
 ### Delete Room Mapping
 
 ```
-DELETE /api/v1/rooms/{id}
+DELETE /api/v1/admin/rooms/{id}
 ```
 
 **Response `200`**
@@ -243,7 +400,7 @@ Webhooks allow external platforms to receive messages that originate from Matrix
 ### Register Webhook
 
 ```
-POST /api/v1/webhooks
+POST /api/v1/admin/webhooks
 ```
 
 **Request Body**
@@ -277,7 +434,7 @@ POST /api/v1/webhooks
 ### List Webhooks
 
 ```
-GET /api/v1/webhooks?platform=myapp
+GET /api/v1/admin/webhooks?platform=myapp
 ```
 
 | Parameter | Required | Description |
@@ -303,7 +460,7 @@ GET /api/v1/webhooks?platform=myapp
 ### Delete Webhook
 
 ```
-DELETE /api/v1/webhooks/{id}
+DELETE /api/v1/admin/webhooks/{id}
 ```
 
 **Response `200`**
@@ -320,6 +477,88 @@ DELETE /api/v1/webhooks/{id}
 {
   "error": "not found"
 }
+```
+
+---
+
+## Puppet Users
+
+Puppet users are Matrix accounts created by the bridge to represent external platform users.
+
+### List Puppets
+
+```
+GET /api/v1/admin/puppets?platform=telegram
+```
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `platform` | No | Filter by platform; omit to list all puppets |
+
+**Response `200`**
+
+```json
+{
+  "puppets": [
+    {
+      "id": 1,
+      "matrix_user_id": "@telegram_user123:example.com",
+      "platform_id": "telegram",
+      "external_user_id": "user123",
+      "display_name": "Alice",
+      "avatar_mxc": "mxc://example.com/abc123"
+    }
+  ]
+}
+```
+
+---
+
+## Message Mappings
+
+Message mappings track the relationship between Matrix events and external platform messages. Supports cursor-based pagination for large datasets.
+
+### List Message Mappings
+
+```
+GET /api/v1/admin/messages?platform=telegram&room_mapping_id=1&after=0&limit=100
+```
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `platform` | No | — | Filter by platform |
+| `room_mapping_id` | No | — | Filter by room mapping ID |
+| `after` | No | `0` | Cursor: return messages with `id > after` |
+| `limit` | No | `100` | Max results per page (max: 1000) |
+
+**Response `200`**
+
+```json
+{
+  "messages": [
+    {
+      "id": 1,
+      "matrix_event_id": "$event123",
+      "platform_id": "telegram",
+      "external_message_id": "msg_456",
+      "room_mapping_id": 1
+    }
+  ],
+  "next_cursor": 1
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `messages` | Array of message mapping objects |
+| `next_cursor` | ID of the last result; pass as `after` for the next page. `null` when the result set is empty |
+
+**Pagination example:**
+
+```
+GET /api/v1/admin/messages?limit=100           → next_cursor: 100
+GET /api/v1/admin/messages?after=100&limit=100 → next_cursor: 200
+GET /api/v1/admin/messages?after=200&limit=100 → next_cursor: null (no more)
 ```
 
 ---
@@ -488,11 +727,12 @@ Default is `false` (allow all targets), suitable for internal deployments.
 The bridge creates Matrix puppet users for external platform senders. The localpart follows this format:
 
 ```
-@{platform}_{sender.id}:{homeserver_domain}
+@{puppet_prefix}_{platform}_{sender.id}:{homeserver_domain}
 ```
 
 **Constraints:**
 
+- `puppet_prefix`: configurable (default: `bot`)
 - `platform`: lowercase letters only (`[a-z]+`)
 - `sender.id`: lowercase alphanumeric plus `.` `_` `-` `=` `/` (`[a-z0-9._\-=/]+`)
 
@@ -500,6 +740,6 @@ The bridge creates Matrix puppet users for external platform senders. The localp
 
 | Platform | Sender ID | Matrix User ID |
 |----------|-----------|----------------|
-| telegram | `12345` | `@telegram_12345:example.com` |
-| slack | `u.bob` | `@slack_u.bob:example.com` |
-| discord | `98765` | `@discord_98765:example.com` |
+| telegram | `12345` | `@bot_telegram_12345:example.com` |
+| slack | `u.bob` | `@bot_slack_u.bob:example.com` |
+| discord | `98765` | `@bot_discord_98765:example.com` |

@@ -293,18 +293,26 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
 /// These routes are for external platform services to interact with the bridge.
 pub fn build_bridge_api_router() -> Router<Arc<AppState>> {
     Router::new()
+        // Server info API
+        .route("/api/v1/admin/info", get(handle_server_info))
         // Message API
-        .route("/api/v1/message", post(handle_send_message))
+        .route("/api/v1/admin/message", post(handle_send_message))
         // Media upload API
-        .route("/api/v1/upload", post(handle_upload))
+        .route("/api/v1/admin/upload", post(handle_upload))
         // Room mapping API
-        .route("/api/v1/rooms", post(handle_create_room_mapping))
-        .route("/api/v1/rooms", get(handle_list_room_mappings))
-        .route("/api/v1/rooms/{id}", delete(handle_delete_room_mapping))
+        .route("/api/v1/admin/rooms", post(handle_create_room_mapping))
+        .route("/api/v1/admin/rooms", get(handle_list_room_mappings))
+        .route("/api/v1/admin/rooms/{id}", delete(handle_delete_room_mapping))
         // Webhook API
-        .route("/api/v1/webhooks", post(handle_create_webhook))
-        .route("/api/v1/webhooks", get(handle_list_webhooks))
-        .route("/api/v1/webhooks/{id}", delete(handle_delete_webhook))
+        .route("/api/v1/admin/webhooks", post(handle_create_webhook))
+        .route("/api/v1/admin/webhooks", get(handle_list_webhooks))
+        .route("/api/v1/admin/webhooks/{id}", delete(handle_delete_webhook))
+        // Puppet (external user) API
+        .route("/api/v1/admin/puppets", get(handle_list_puppets))
+        // Message mapping API
+        .route("/api/v1/admin/messages", get(handle_list_messages))
+        // Crypto status API
+        .route("/api/v1/admin/crypto", get(handle_crypto_status))
 }
 
 /// Convert a ContentPayload (API input) to MessageContent (internal).
@@ -365,7 +373,7 @@ fn convert_content(payload: ContentPayload) -> MessageContent {
     }
 }
 
-/// POST /api/v1/message
+/// POST /api/v1/admin/message
 ///
 /// External platform sends a message to be bridged into Matrix.
 ///
@@ -484,7 +492,7 @@ async fn auto_create_room(
     Ok(id)
 }
 
-/// POST /api/v1/rooms
+/// POST /api/v1/admin/rooms
 ///
 /// Idempotent: if a mapping for `(platform, external_room_id)` already exists,
 /// returns the existing mapping (200). Otherwise creates a new one (201).
@@ -644,22 +652,24 @@ async fn handle_create_room_mapping(
     }
 }
 
-/// GET /api/v1/rooms?platform=xxx
+/// GET /api/v1/admin/rooms?platform=xxx
+///
+/// List room mappings. When `platform` is provided, returns mappings for that
+/// platform only. When omitted, returns all room mappings.
 async fn handle_list_room_mappings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let platform = params.get("platform").map(|s| s.as_str()).unwrap_or("");
     let dispatcher = state.dispatcher.lock().await;
+    let platform = params.get("platform").map(|s| s.as_str());
 
-    if platform.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "platform query parameter required" })),
-        );
-    }
+    let result = if let Some(p) = platform {
+        dispatcher.db().list_room_mappings(p).await
+    } else {
+        dispatcher.db().list_all_room_mappings().await
+    };
 
-    match dispatcher.db().list_room_mappings(platform).await {
+    match result {
         Ok(mappings) => (StatusCode::OK, Json(json!({ "rooms": mappings }))),
         Err(e) => {
             error!("list room mappings failed: {e}");
@@ -671,7 +681,7 @@ async fn handle_list_room_mappings(
     }
 }
 
-/// DELETE /api/v1/rooms/{id}
+/// DELETE /api/v1/admin/rooms/{id}
 async fn handle_delete_room_mapping(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -690,7 +700,7 @@ async fn handle_delete_room_mapping(
     }
 }
 
-/// POST /api/v1/webhooks
+/// POST /api/v1/admin/webhooks
 async fn handle_create_webhook(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateWebhookRequest>,
@@ -727,7 +737,7 @@ async fn handle_create_webhook(
     }
 }
 
-/// GET /api/v1/webhooks?platform=xxx
+/// GET /api/v1/admin/webhooks?platform=xxx
 async fn handle_list_webhooks(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -753,7 +763,7 @@ async fn handle_list_webhooks(
     }
 }
 
-/// DELETE /api/v1/webhooks/{id}
+/// DELETE /api/v1/admin/webhooks/{id}
 async fn handle_delete_webhook(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -772,7 +782,231 @@ async fn handle_delete_webhook(
     }
 }
 
-/// POST /api/v1/upload
+/// GET /api/v1/admin/puppets?platform=xxx
+///
+/// List puppet (external) users. When `platform` is provided, returns puppets
+/// for that platform only. When omitted, returns all puppets.
+async fn handle_list_puppets(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dispatcher = state.dispatcher.lock().await;
+    let platform = params.get("platform").map(|s| s.as_str());
+
+    let result = if let Some(p) = platform {
+        dispatcher.db().list_puppets(p).await
+    } else {
+        dispatcher.db().list_all_puppets().await
+    };
+
+    match result {
+        Ok(puppets) => (StatusCode::OK, Json(json!({ "puppets": puppets }))),
+        Err(e) => {
+            error!("list puppets failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/admin/messages?platform=xxx&room_mapping_id=1&after=0&limit=100
+///
+/// List message mappings with cursor-based pagination.
+///
+/// Query parameters (all optional):
+/// - `platform`: filter by platform ID.
+/// - `room_mapping_id`: filter by room mapping ID.
+/// - `after`: return messages with `id > after` (cursor, default 0).
+/// - `limit`: max results (default 100, max 1000).
+async fn handle_list_messages(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dispatcher = state.dispatcher.lock().await;
+    let platform = params.get("platform").map(|s| s.as_str());
+    let room_mapping_id = params
+        .get("room_mapping_id")
+        .and_then(|s| s.parse::<i64>().ok());
+    let after = params
+        .get("after")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(100);
+
+    match dispatcher
+        .db()
+        .list_message_mappings(platform, room_mapping_id, after, limit)
+        .await
+    {
+        Ok(messages) => {
+            let next_cursor = messages.last().map(|m| m.id);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "messages": messages,
+                    "next_cursor": next_cursor,
+                })),
+            )
+        }
+        Err(e) => {
+            error!("list message mappings failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+        }
+    }
+}
+
+/// GET /api/v1/admin/crypto
+///
+/// Returns encryption key status for the bot and all initialized puppets.
+/// Queries the homeserver for actual device key state.
+///
+/// Response:
+/// ```json
+/// {
+///   "enabled": true,
+///   "per_user_crypto": true,
+///   "bot": { "user_id": "...", "device_id": "...", "has_master_key": true, ... },
+///   "puppets": [ ... ]
+/// }
+/// ```
+async fn handle_crypto_status(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let Some(pool) = &state.crypto_pool else {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "enabled": false,
+                "per_user_crypto": false,
+                "bot": null,
+                "puppets": [],
+            })),
+        );
+    };
+
+    let bot_status = match pool.bot().crypto_status().await {
+        Ok(s) => serde_json::to_value(s).unwrap_or_default(),
+        Err(e) => {
+            error!("failed to query bot crypto status: {e}");
+            json!({ "error": format!("{e}") })
+        }
+    };
+
+    let all = pool.get_all().await;
+    let mut puppet_statuses = Vec::new();
+    for cm in &all {
+        // Skip the bot (already handled above).
+        if cm.user_id() == pool.bot().user_id() {
+            continue;
+        }
+        match cm.crypto_status().await {
+            Ok(s) => puppet_statuses.push(serde_json::to_value(s).unwrap_or_default()),
+            Err(e) => {
+                error!(user_id = %cm.user_id(), "failed to query puppet crypto status: {e}");
+                puppet_statuses.push(json!({
+                    "user_id": cm.user_id().to_string(),
+                    "device_id": cm.device_id().to_string(),
+                    "error": format!("{e}"),
+                }));
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "enabled": true,
+            "per_user_crypto": pool.is_per_user(),
+            "bot": bot_status,
+            "puppets": puppet_statuses,
+        })),
+    )
+}
+
+/// GET /api/v1/admin/info
+///
+/// Returns server configuration and runtime statistics.
+///
+/// Response:
+/// ```json
+/// {
+///   "version": "0.1.0",
+///   "homeserver": { "url": "https://matrix.example.com", "domain": "example.com" },
+///   "bot": { "user_id": "@bridge:example.com", "puppet_prefix": "bot" },
+///   "features": {
+///     "encryption_enabled": false,
+///     "encryption_default": false,
+///     "webhook_ssrf_protection": false,
+///     "api_key_required": true
+///   },
+///   "permissions": { "invite_whitelist": ["@admin:example.com"] },
+///   "platforms": { "configured": ["telegram"], "active": ["telegram"] },
+///   "stats": {
+///     "room_mappings": 5,
+///     "webhooks": 3,
+///     "message_mappings": 1024,
+///     "puppets": 42
+///   }
+/// }
+/// ```
+async fn handle_server_info(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let info = &state.bridge_info;
+
+    let dispatcher = state.dispatcher.lock().await;
+    let db = dispatcher.db();
+
+    let room_mappings = db.count_room_mappings().await.unwrap_or(-1);
+    let webhooks = db.count_webhooks().await.unwrap_or(-1);
+    let message_mappings = db.count_message_mappings().await.unwrap_or(-1);
+    let puppets = db.count_puppets().await.unwrap_or(-1);
+    let active_platforms = db.list_active_platforms().await.unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "homeserver": {
+                "url": info.homeserver_url,
+                "domain": info.homeserver_domain,
+            },
+            "bot": {
+                "user_id": info.bot_user_id,
+                "puppet_prefix": info.puppet_prefix,
+            },
+            "features": {
+                "encryption_enabled": info.encryption_enabled,
+                "encryption_default": info.encryption_default,
+                "webhook_ssrf_protection": info.webhook_ssrf_protection,
+                "api_key_required": info.api_key_required,
+            },
+            "permissions": {
+                "invite_whitelist": info.invite_whitelist,
+            },
+            "platforms": {
+                "configured": info.configured_platforms,
+                "active": active_platforms,
+            },
+            "stats": {
+                "room_mappings": room_mappings,
+                "webhooks": webhooks,
+                "message_mappings": message_mappings,
+                "puppets": puppets,
+            },
+        })),
+    )
+}
+
+/// POST /api/v1/admin/upload
 ///
 /// Upload a file to the Matrix media repository.
 /// Accepts multipart/form-data with a single `file` field.
@@ -780,7 +1014,7 @@ async fn handle_delete_webhook(
 ///
 /// Example (curl):
 /// ```bash
-/// curl -X POST http://bridge:29320/api/v1/upload \
+/// curl -X POST http://bridge:29320/api/v1/admin/upload \
 ///   -F "file=@photo.jpg;type=image/jpeg"
 /// ```
 ///
