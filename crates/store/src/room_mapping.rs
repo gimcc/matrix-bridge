@@ -145,6 +145,27 @@ impl Database {
         }
     }
 
+    /// List all room mappings across all platforms.
+    pub async fn list_all_room_mappings(&self) -> anyhow::Result<Vec<RoomMapping>> {
+        let conn = self.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, matrix_room_id, platform_id, external_room_id FROM room_mappings",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RoomMapping {
+                id: row.get(0)?,
+                matrix_room_id: row.get(1)?,
+                platform_id: row.get(2)?,
+                external_room_id: row.get(3)?,
+            })
+        })?;
+        let mut mappings = Vec::new();
+        for row in rows {
+            mappings.push(row?);
+        }
+        Ok(mappings)
+    }
+
     /// List all room mappings for a given platform.
     pub async fn list_room_mappings(&self, platform_id: &str) -> anyhow::Result<Vec<RoomMapping>> {
         let conn = self.lock().await;

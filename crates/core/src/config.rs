@@ -109,7 +109,7 @@ pub struct AppserviceConfig {
     /// Default: `"bot"` → `@bot_telegram_12345:domain`.
     #[serde(default = "default_puppet_prefix")]
     pub puppet_prefix: String,
-    /// Optional API key for the Bridge HTTP API (`/api/v1/*` routes).
+    /// Optional API key for the Bridge HTTP API (`/api/v1/admin/*` routes).
     /// When set, every Bridge API request must include this key via
     /// `Authorization: Bearer <api_key>` header or `access_token` query param.
     /// When empty (default), the Bridge API requires no authentication —

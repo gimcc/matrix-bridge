@@ -10,7 +10,7 @@ use matrix_bridge_appservice::crypto_pool::CryptoManagerPool;
 use matrix_bridge_appservice::dispatcher::Dispatcher;
 use matrix_bridge_appservice::matrix_client::MatrixClient;
 use matrix_bridge_appservice::puppet_manager::PuppetManager;
-use matrix_bridge_appservice::server::{self, AppState};
+use matrix_bridge_appservice::server::{self, AppState, BridgeInfo};
 use matrix_bridge_core::config::AppConfig;
 use matrix_bridge_core::registration;
 use matrix_bridge_store::Database;
@@ -304,6 +304,27 @@ async fn main() -> anyhow::Result<()> {
         dispatcher.set_crypto(Arc::clone(pool), config.encryption.default);
     }
 
+    // Build bridge info (non-sensitive config for the info API).
+    let bridge_info = BridgeInfo {
+        homeserver_url: config.homeserver.url.clone(),
+        homeserver_domain: config.homeserver.domain.clone(),
+        bot_user_id: format!(
+            "@{}:{}",
+            config.appservice.sender_localpart, config.homeserver.domain
+        ),
+        puppet_prefix: config.appservice.puppet_prefix.clone(),
+        encryption_enabled: config.encryption.allow,
+        encryption_default: config.encryption.default,
+        webhook_ssrf_protection: config.appservice.webhook_ssrf_protection,
+        api_key_required: config
+            .appservice
+            .api_key
+            .as_ref()
+            .is_some_and(|k| !k.is_empty()),
+        configured_platforms: config.platforms.keys().cloned().collect(),
+        invite_whitelist: config.permissions.invite_whitelist.clone(),
+    };
+
     // Build app state.
     let state = Arc::new(AppState {
         dispatcher: Arc::new(Mutex::new(dispatcher)),
@@ -313,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
         auto_invite: config.appservice.auto_invite.clone(),
         allow_api_invite: config.appservice.allow_api_invite,
         encryption_default: config.encryption.default,
+        bridge_info,
     });
 
     // Start HTTP server.

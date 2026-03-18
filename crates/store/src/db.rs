@@ -68,4 +68,54 @@ impl Database {
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
     }
+
+    /// Count all room mappings.
+    pub async fn count_room_mappings(&self) -> anyhow::Result<i64> {
+        let conn = self.lock().await;
+        let count = conn
+            .prepare("SELECT COUNT(*) FROM room_mappings")?
+            .query_row([], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Count all webhooks.
+    pub async fn count_webhooks(&self) -> anyhow::Result<i64> {
+        let conn = self.lock().await;
+        let count = conn
+            .prepare("SELECT COUNT(*) FROM webhooks")?
+            .query_row([], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Count all message mappings.
+    pub async fn count_message_mappings(&self) -> anyhow::Result<i64> {
+        let conn = self.lock().await;
+        let count = conn
+            .prepare("SELECT COUNT(*) FROM message_mappings")?
+            .query_row([], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Count all puppet users.
+    pub async fn count_puppets(&self) -> anyhow::Result<i64> {
+        let conn = self.lock().await;
+        let count = conn
+            .prepare("SELECT COUNT(*) FROM puppets")?
+            .query_row([], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// List distinct platform IDs that have room mappings.
+    pub async fn list_active_platforms(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT platform_id FROM room_mappings ORDER BY platform_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut platforms = Vec::new();
+        for row in rows {
+            platforms.push(row?);
+        }
+        Ok(platforms)
+    }
 }
