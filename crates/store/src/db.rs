@@ -40,12 +40,6 @@ impl Database {
     pub async fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute_batch(include_str!("migrations/001_initial.sql"))?;
-        conn.execute_batch(include_str!("migrations/002_webhooks.sql"))?;
-        conn.execute_batch(include_str!(
-            "migrations/003_message_mapping_multi_platform.sql"
-        ))?;
-
-        conn.execute_batch(include_str!("migrations/004_forward_sources.sql"))?;
 
         info!("database migrations applied");
         Ok(())

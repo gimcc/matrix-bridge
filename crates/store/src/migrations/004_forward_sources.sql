@@ -1,3 +1,0 @@
--- Migration 004: forward_sources column.
--- Now included in 002_webhooks.sql for fresh databases.
--- This file kept for migration numbering consistency.
