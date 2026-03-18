@@ -130,6 +130,8 @@ mod tests {
             puppet_prefix: "bot".to_string(),
             api_key: None,
             webhook_ssrf_protection: false,
+            auto_invite: vec![],
+            allow_api_invite: false,
         };
 
         let reg = build_registration(

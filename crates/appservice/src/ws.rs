@@ -27,17 +27,30 @@ const MAX_WS_CLIENTS: usize = 1000;
 /// Maximum length for a platform ID.
 const MAX_PLATFORM_ID_LEN: usize = 64;
 
-/// Maximum number of entries in `exclude_sources`.
-const MAX_EXCLUDE_SOURCES: usize = 20;
+/// Maximum number of entries in `forward_sources`.
+const MAX_FORWARD_SOURCES: usize = 20;
 
-/// Maximum length for each `exclude_sources` entry.
-const MAX_EXCLUDE_SOURCE_LEN: usize = 64;
+/// Maximum length for each `forward_sources` entry.
+const MAX_FORWARD_SOURCE_LEN: usize = 64;
 
 /// A connected WebSocket client.
 struct WsClient {
     id: String,
     sender: mpsc::Sender<String>,
-    exclude_sources: Vec<String>,
+    forward_sources: Vec<String>,
+}
+
+impl WsClient {
+    /// Check if messages from the given source platform should be forwarded.
+    fn should_forward_source(&self, source_platform: &str) -> bool {
+        if self.forward_sources.is_empty() {
+            return false;
+        }
+        if self.forward_sources.iter().any(|s| s == "*") {
+            return true;
+        }
+        self.forward_sources.iter().any(|s| s == source_platform)
+    }
 }
 
 /// Registry of active WebSocket connections, keyed by platform ID.
@@ -69,7 +82,7 @@ impl WsRegistry {
     fn register(
         &self,
         platform_id: &str,
-        exclude_sources: Vec<String>,
+        forward_sources: Vec<String>,
     ) -> (String, mpsc::Receiver<String>) {
         let id = ulid::Ulid::new().to_string();
         let (tx, rx) = mpsc::channel(CLIENT_CHANNEL_CAPACITY);
@@ -77,7 +90,7 @@ impl WsRegistry {
         let client = WsClient {
             id: id.clone(),
             sender: tx,
-            exclude_sources,
+            forward_sources,
         };
 
         self.clients
@@ -107,13 +120,15 @@ impl WsRegistry {
 
     /// Broadcast a JSON payload to all clients subscribed to the given platform.
     ///
-    /// Skips clients whose `exclude_sources` contains `source_platform`.
-    /// Uses `try_send` to avoid blocking on slow consumers.
+    /// Only delivers to clients whose `forward_sources` allowlist includes
+    /// `source_platform`. Uses `try_send` to avoid blocking on slow consumers.
     ///
     /// Uses a read lock for iteration (sending) and only acquires a write lock
     /// when dead clients need to be cleaned up, reducing contention with
     /// concurrent register/unregister operations on the same shard.
     pub fn broadcast(&self, platform_id: &str, payload: &str, source_platform: Option<&str>) {
+        let effective_source = source_platform.unwrap_or("matrix");
+
         // Phase 1: read lock — iterate and send, collect dead client IDs.
         let closed_ids = {
             let Some(entry) = self.clients.get(platform_id) else {
@@ -123,9 +138,7 @@ impl WsRegistry {
             let mut closed = Vec::new();
 
             for client in entry.iter() {
-                if let Some(src) = source_platform
-                    && client.exclude_sources.iter().any(|s| s == src)
-                {
+                if !client.should_forward_source(effective_source) {
                     continue;
                 }
                 match client.sender.try_send(payload.to_string()) {
@@ -173,8 +186,9 @@ pub struct WsConnectParams {
     pub platform: String,
     /// API key for authentication (required if `api_key` is configured).
     pub access_token: Option<String>,
-    /// Comma-separated platform IDs whose messages should be excluded.
-    pub exclude_sources: Option<String>,
+    /// Comma-separated allowlist of source platform IDs to forward.
+    /// Empty = deny all (default), "*" = forward all.
+    pub forward_sources: Option<String>,
 }
 
 /// Validate that a platform ID contains only allowed characters and is bounded.
@@ -187,7 +201,7 @@ fn is_valid_platform_id(s: &str) -> bool {
 
 /// Validate WebSocket connection parameters and authenticate.
 ///
-/// Returns `Ok((platform, exclude_sources))` on success, or `Err((status, message))`
+/// Returns `Ok((platform, forward_sources))` on success, or `Err((status, message))`
 /// on validation/auth failure. Extracted for testability without a real TCP connection.
 fn validate_ws_params(
     params: &WsConnectParams,
@@ -213,20 +227,20 @@ fn validate_ws_params(
     }
 
     let platform = params.platform.clone();
-    let exclude_sources: Vec<String> = params
-        .exclude_sources
+    let forward_sources: Vec<String> = params
+        .forward_sources
         .as_deref()
         .unwrap_or("")
         .split(',')
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.len() <= MAX_EXCLUDE_SOURCE_LEN)
-        .take(MAX_EXCLUDE_SOURCES)
+        .filter(|s| !s.is_empty() && s.len() <= MAX_FORWARD_SOURCE_LEN)
+        .take(MAX_FORWARD_SOURCES)
         .collect();
 
-    Ok((platform, exclude_sources))
+    Ok((platform, forward_sources))
 }
 
-/// GET /api/v1/ws?platform=xxx&access_token=yyy&exclude_sources=a,b
+/// GET /api/v1/ws?platform=xxx&access_token=yyy&forward_sources=*
 ///
 /// Upgrades the HTTP connection to a WebSocket for real-time message delivery.
 pub async fn handle_ws_upgrade(
@@ -234,12 +248,12 @@ pub async fn handle_ws_upgrade(
     Query(params): Query<WsConnectParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let (platform, exclude_sources) = match validate_ws_params(&params, &state) {
+    let (platform, forward_sources) = match validate_ws_params(&params, &state) {
         Ok(v) => v,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
-    ws.on_upgrade(move |socket| handle_ws_session(state, platform, exclude_sources, socket))
+    ws.on_upgrade(move |socket| handle_ws_session(state, platform, forward_sources, socket))
 }
 
 /// Run a WebSocket session: forward messages from the registry to the client,
@@ -247,10 +261,10 @@ pub async fn handle_ws_upgrade(
 async fn handle_ws_session(
     state: Arc<AppState>,
     platform: String,
-    exclude_sources: Vec<String>,
+    forward_sources: Vec<String>,
     socket: axum::extract::ws::WebSocket,
 ) {
-    let (client_id, mut rx) = state.ws_registry.register(&platform, exclude_sources);
+    let (client_id, mut rx) = state.ws_registry.register(&platform, forward_sources);
 
     info!(
         client_id,
@@ -349,9 +363,9 @@ mod tests {
     #[test]
     fn test_broadcast_delivers_to_matching_platform() {
         let registry = WsRegistry::new();
-        let (_id1, mut rx1) = registry.register("telegram", vec![]);
-        let (_id2, mut rx2) = registry.register("telegram", vec![]);
-        let (_id3, mut rx3) = registry.register("slack", vec![]);
+        let (_id1, mut rx1) = registry.register("telegram", vec!["*".to_string()]);
+        let (_id2, mut rx2) = registry.register("telegram", vec!["*".to_string()]);
+        let (_id3, mut rx3) = registry.register("slack", vec!["*".to_string()]);
 
         registry.broadcast("telegram", r#"{"event":"message"}"#, None);
 
@@ -361,21 +375,39 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_exclude_sources() {
+    fn test_broadcast_forward_sources() {
         let registry = WsRegistry::new();
-        let (_id1, mut rx1) = registry.register("telegram", vec!["matrix".to_string()]);
-        let (_id2, mut rx2) = registry.register("telegram", vec![]);
+        // Client 1: only forwards "slack" → should NOT receive "matrix"
+        let (_id1, mut rx1) = registry.register("telegram", vec!["slack".to_string()]);
+        // Client 2: forwards all → should receive "matrix"
+        let (_id2, mut rx2) = registry.register("telegram", vec!["*".to_string()]);
+        // Client 3: empty forward_sources → should NOT receive anything
+        let (_id3, mut rx3) = registry.register("telegram", vec![]);
 
         registry.broadcast("telegram", r#"{"event":"message"}"#, Some("matrix"));
 
-        assert!(rx1.try_recv().is_err()); // excluded
-        assert!(rx2.try_recv().is_ok()); // not excluded
+        assert!(rx1.try_recv().is_err()); // matrix not in allowlist
+        assert!(rx2.try_recv().is_ok()); // wildcard allows all
+        assert!(rx3.try_recv().is_err()); // empty = deny all
+    }
+
+    #[test]
+    fn test_broadcast_no_source_defaults_to_matrix() {
+        let registry = WsRegistry::new();
+        let (_id1, mut rx1) = registry.register("telegram", vec!["matrix".to_string()]);
+        let (_id2, mut rx2) = registry.register("telegram", vec!["slack".to_string()]);
+
+        // No source_platform → treated as "matrix"
+        registry.broadcast("telegram", r#"{"event":"message"}"#, None);
+
+        assert!(rx1.try_recv().is_ok()); // "matrix" in allowlist
+        assert!(rx2.try_recv().is_err()); // "matrix" not in allowlist
     }
 
     #[test]
     fn test_slow_consumer_does_not_block() {
         let registry = WsRegistry::new();
-        let (_id, _rx) = registry.register("test", vec![]);
+        let (_id, _rx) = registry.register("test", vec!["*".to_string()]);
 
         // Fill the channel beyond capacity — should not panic or block.
         for i in 0..CLIENT_CHANNEL_CAPACITY + 10 {
@@ -388,7 +420,7 @@ mod tests {
     #[test]
     fn test_closed_client_is_cleaned_up() {
         let registry = WsRegistry::new();
-        let (id, rx) = registry.register("test", vec![]);
+        let (id, rx) = registry.register("test", vec!["*".to_string()]);
         assert_eq!(registry.total_clients(), 1);
 
         // Drop the receiver to simulate a disconnected client.
@@ -483,11 +515,15 @@ mod tests {
             }
         }
 
-        fn params(platform: &str, token: Option<&str>, exclude: Option<&str>) -> WsConnectParams {
+        fn params(
+            platform: &str,
+            token: Option<&str>,
+            forward: Option<&str>,
+        ) -> WsConnectParams {
             WsConnectParams {
                 platform: platform.to_string(),
                 access_token: token.map(|s| s.to_string()),
-                exclude_sources: exclude.map(|s| s.to_string()),
+                forward_sources: forward.map(|s| s.to_string()),
             }
         }
 
@@ -522,7 +558,8 @@ mod tests {
         #[test]
         fn accepts_valid_token() {
             let state = test_state(Some("secret123".to_string()), Arc::new(WsRegistry::new()));
-            let result = validate_ws_params(&params("telegram", Some("secret123"), None), &state);
+            let result =
+                validate_ws_params(&params("telegram", Some("secret123"), None), &state);
             let (platform, _) = result.unwrap();
             assert_eq!(platform, "telegram");
         }
@@ -546,28 +583,28 @@ mod tests {
         fn allows_unauthenticated_when_no_api_key() {
             let state = test_state(None, Arc::new(WsRegistry::new()));
             let result = validate_ws_params(&params("telegram", None, None), &state);
-            let (platform, exclude) = result.unwrap();
+            let (platform, fwd) = result.unwrap();
             assert_eq!(platform, "telegram");
-            assert!(exclude.is_empty());
+            assert!(fwd.is_empty());
         }
 
         #[test]
-        fn parses_exclude_sources() {
+        fn parses_forward_sources() {
             let state = test_state(None, Arc::new(WsRegistry::new()));
             let result =
                 validate_ws_params(&params("telegram", None, Some("matrix, slack")), &state);
-            let (_, exclude) = result.unwrap();
-            assert_eq!(exclude, vec!["matrix", "slack"]);
+            let (_, fwd) = result.unwrap();
+            assert_eq!(fwd, vec!["matrix", "slack"]);
         }
 
         #[test]
-        fn filters_empty_and_oversized_exclude_sources() {
+        fn filters_empty_and_oversized_forward_sources() {
             let state = test_state(None, Arc::new(WsRegistry::new()));
-            let long = "x".repeat(MAX_EXCLUDE_SOURCE_LEN + 1);
+            let long = "x".repeat(MAX_FORWARD_SOURCE_LEN + 1);
             let input = format!("ok,,{long},valid");
             let result = validate_ws_params(&params("telegram", None, Some(&input)), &state);
-            let (_, exclude) = result.unwrap();
-            assert_eq!(exclude, vec!["ok", "valid"]);
+            let (_, fwd) = result.unwrap();
+            assert_eq!(fwd, vec!["ok", "valid"]);
         }
     }
 }
