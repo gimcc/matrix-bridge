@@ -988,6 +988,7 @@ async fn handle_server_info(
                 "encryption_default": info.encryption_default,
                 "webhook_ssrf_protection": info.webhook_ssrf_protection,
                 "api_key_required": info.api_key_required,
+                "websocket_enabled": true,
             },
             "permissions": {
                 "invite_whitelist": info.invite_whitelist,
@@ -1001,6 +1002,7 @@ async fn handle_server_info(
                 "webhooks": webhooks,
                 "message_mappings": message_mappings,
                 "puppets": puppets,
+                "ws_clients": state.ws_registry.total_clients(),
             },
         })),
     )

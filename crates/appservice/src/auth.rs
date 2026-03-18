@@ -23,7 +23,7 @@ fn extract_bearer_token(request: &Request) -> Option<String> {
 }
 
 /// Verify that the request carries a valid token (constant-time comparison).
-fn verify_token(provided: &str, expected: &str) -> bool {
+pub(crate) fn verify_token(provided: &str, expected: &str) -> bool {
     if provided.len() != expected.len() {
         return false;
     }

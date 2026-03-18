@@ -12,6 +12,7 @@ use matrix_bridge_store::Database;
 use crate::crypto_pool::CryptoManagerPool;
 use crate::matrix_client::MatrixClient;
 use crate::puppet_manager::PuppetManager;
+use crate::ws::WsRegistry;
 
 /// Routes events between Matrix and external platforms.
 ///
@@ -31,6 +32,8 @@ pub struct Dispatcher {
     puppet_user_prefix: String,
     /// Shared HTTP client for webhook delivery (reuses connection pool).
     http_client: reqwest::Client,
+    /// WebSocket client registry for real-time message delivery.
+    ws_registry: Arc<WsRegistry>,
     /// Optional crypto manager pool for encrypting outbound messages.
     crypto_pool: Option<Arc<CryptoManagerPool>>,
     /// Whether to auto-enable encryption for rooms on link.
@@ -48,6 +51,7 @@ impl Dispatcher {
         sender_localpart: &str,
         puppet_prefix: &str,
         permissions: PermissionsConfig,
+        ws_registry: Arc<WsRegistry>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -63,6 +67,7 @@ impl Dispatcher {
             puppet_prefix: puppet_prefix.to_string(),
             puppet_user_prefix: format!("@{puppet_prefix}_"),
             http_client,
+            ws_registry,
             crypto_pool: None,
             encryption_default: false,
             permissions,
@@ -534,12 +539,6 @@ impl Dispatcher {
         message: &BridgeMessage,
         source_platform: Option<&str>,
     ) -> anyhow::Result<()> {
-        let webhooks = self.db.list_webhooks(platform_id).await?;
-        if webhooks.is_empty() {
-            debug!(platform = platform_id, "no webhooks registered, skipping");
-            return Ok(());
-        }
-
         let mut payload = serde_json::json!({
             "event": "message",
             "platform": platform_id,
@@ -547,6 +546,20 @@ impl Dispatcher {
         });
         if let Some(src) = source_platform {
             payload["source_platform"] = serde_json::Value::String(src.to_string());
+        }
+
+        // Serialize once for both webhooks and WebSocket clients.
+        let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+
+        // Deliver to WebSocket clients (non-blocking, lock-free).
+        self.ws_registry
+            .broadcast(platform_id, &payload_str, source_platform);
+
+        // Deliver to HTTP webhooks.
+        let webhooks = self.db.list_webhooks(platform_id).await?;
+        if webhooks.is_empty() {
+            debug!(platform = platform_id, "no webhooks registered, skipping");
+            return Ok(());
         }
 
         for webhook in &webhooks {

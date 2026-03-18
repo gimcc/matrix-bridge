@@ -20,6 +20,7 @@ use crate::auth::{ApiKey, HsToken, verify_api_key, verify_hs_token};
 use crate::bridge_api;
 use crate::crypto_pool::CryptoManagerPool;
 use crate::dispatcher::Dispatcher;
+use crate::ws::{self, WsRegistry};
 
 /// Maximum number of transaction IDs to keep for deduplication.
 const MAX_PROCESSED_TXNS: usize = 10_000;
@@ -56,6 +57,10 @@ pub struct AppState {
     pub encryption_default: bool,
     /// Non-sensitive server info for the info API.
     pub bridge_info: BridgeInfo,
+    /// Registry of active WebSocket connections.
+    pub ws_registry: Arc<WsRegistry>,
+    /// Optional API key for the Bridge HTTP API (cached for WS auth).
+    pub api_key: Option<String>,
 }
 
 /// Build the axum Router for the appservice HTTP endpoints.
@@ -90,9 +95,13 @@ pub fn build_router(state: Arc<AppState>, hs_token: String, api_key: Option<Stri
         bridge_api::build_bridge_api_router()
     };
 
+    // WebSocket endpoint — authenticates via query param, not middleware.
+    let ws_route = Router::new().route("/api/v1/ws", get(ws::handle_ws_upgrade));
+
     // Merge all routes under one state.
     matrix_routes
         .merge(bridge_routes)
+        .merge(ws_route)
         .route("/health", get(handle_health))
         .with_state(state)
 }
