@@ -79,6 +79,24 @@ export async function deleteWebhook(id: number): Promise<void> {
   await bridgeRequest({ method: "DELETE", path: `/api/v1/webhooks/${id}` });
 }
 
+export interface WebhookEntry {
+  id: number;
+  platform_id: string;
+  webhook_url: string;
+  forward_sources: string;
+}
+
+export async function listWebhooks(
+  platform?: string,
+): Promise<WebhookEntry[]> {
+  const query = platform ? `?platform=${encodeURIComponent(platform)}` : "";
+  const result = await bridgeRequest<{ webhooks: WebhookEntry[] }>({
+    method: "GET",
+    path: `/api/v1/admin/webhooks${query}`,
+  });
+  return result.webhooks;
+}
+
 // ─── Messages ────────────────────────────────────────────────────────────────
 
 export interface SendMessageResult {

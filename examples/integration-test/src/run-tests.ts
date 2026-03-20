@@ -146,7 +146,17 @@ async function setup(): Promise<void> {
   // Wait for the bot to join rooms via auto-join.
   await sleep(3000);
 
-  // 4. Register webhook to receive outbound messages.
+  // 4. Clean up stale webhooks from previous test runs, then register a new one.
+  try {
+    const existing = await bridge.listWebhooks(config.platform);
+    for (const wh of existing) {
+      console.log(`  Removing stale webhook id=${wh.id} url=${wh.webhook_url}`);
+      await bridge.deleteWebhook(wh.id);
+    }
+  } catch (err) {
+    console.warn(`  [setup] stale webhook cleanup failed (non-fatal): ${err}`);
+  }
+
   const webhookUrl = `http://${config.webhookHost}:${port}/webhook`;
   const whResult = await bridge.createWebhook(
     config.platform,
@@ -355,11 +365,18 @@ async function testInboundPlain(): Promise<void> {
       plainExternalRoomId,
       "test-user-1",
       "Test User",
-      { type: "image", url: uploaded.content_uri, mimetype: "image/png" },
+      { type: "image", url: uploaded.content_uri, mimetype: "image/png", width: 1, height: 1, size: imageData.length },
     );
 
     const msg = await matrixClient.waitForMessage((m) => m.type === "m.image");
     assertDefined(msg.content.url, "image url");
+    // Verify metadata is included in Matrix event info object.
+    const info = msg.content.info as Record<string, unknown> | undefined;
+    assertDefined(info, "image info");
+    assertEqual(info!.mimetype as string, "image/png", "image info mimetype");
+    assertEqual(info!.w as number, 1, "image info width");
+    assertEqual(info!.h as number, 1, "image info height");
+    assertEqual(info!.size as number, imageData.length, "image info size");
   });
 
   await test("send file via bridge API upload flow", async () => {
@@ -523,7 +540,12 @@ async function testOutboundPlain(): Promise<void> {
       url.startsWith("http://") || url.startsWith("https://"),
       `URL should be HTTP, got: ${url}`,
     );
-    assertContains(url, "/_matrix/media", "media download path");
+    assertContains(url, "/_matrix/client/v1/media", "media download path");
+    // Verify image metadata is preserved in outbound webhook payload.
+    const content = payload.message.content;
+    assertEqual(content.mimetype as string, "image/png", "image mimetype");
+    assertDefined(content.size, "image size");
+    assert((content.size as number) > 0, "image size > 0");
   });
 
   await test("file message forwarded with HTTP URL", async () => {
@@ -542,6 +564,11 @@ async function testOutboundPlain(): Promise<void> {
       url.startsWith("http://") || url.startsWith("https://"),
       `File URL should be HTTP, got: ${url}`,
     );
+    // Verify file metadata is preserved.
+    const content = payload.message.content;
+    assertEqual(content.filename as string, "webhook-test.txt", "file filename");
+    assertEqual(content.mimetype as string, "text/plain", "file mimetype");
+    assertDefined(content.size, "file size");
   });
 
   // Note: outbound m.location parsing is not implemented in the bridge.
@@ -594,10 +621,11 @@ async function testOutboundEncrypted(): Promise<void> {
       url.startsWith("http://") || url.startsWith("https://"),
       `Encrypted image URL should be HTTP after bridge decryption, got: ${url}`,
     );
-    assertContains(url, "/_matrix/media/v3/download/", "media download path");
-
-    // Note: The bridge uses its internal homeserver URL (e.g., http://matrix:8008)
-    // which may not be accessible from the test runner. Only verify URL format.
+    assertContains(url, "/_matrix/client/v1/media/download/", "media download path");
+    // Verify image metadata is preserved after decryption roundtrip.
+    const content = payload.message.content;
+    assertEqual(content.mimetype as string, "image/png", "encrypted image mimetype");
+    assertDefined(content.size, "encrypted image size");
   });
 
   await sleep(2000);
@@ -626,7 +654,9 @@ async function testOutboundEncrypted(): Promise<void> {
       url.startsWith("http://") || url.startsWith("https://"),
       `Encrypted file URL should be HTTP, got: ${url}`,
     );
-
+    // Verify file metadata preserved after decryption.
+    assertEqual(payload.message.content.mimetype as string, "application/octet-stream", "encrypted file mimetype");
+    assertDefined(payload.message.content.size, "encrypted file size");
   });
 
   await sleep(2000);
@@ -656,6 +686,9 @@ async function testOutboundEncrypted(): Promise<void> {
       url.startsWith("http://") || url.startsWith("https://"),
       `Encrypted video URL should be HTTP, got: ${url}`,
     );
+    // Verify video metadata preserved.
+    assertEqual(payload.message.content.mimetype as string, "video/mp4", "encrypted video mimetype");
+    assertDefined(payload.message.content.size, "encrypted video size");
   });
 
   await sleep(2000);
@@ -684,6 +717,9 @@ async function testOutboundEncrypted(): Promise<void> {
       url.startsWith("http://") || url.startsWith("https://"),
       `Encrypted audio URL should be HTTP, got: ${url}`,
     );
+    // Verify audio metadata preserved.
+    assertEqual(payload.message.content.mimetype as string, "audio/ogg", "encrypted audio mimetype");
+    assertDefined(payload.message.content.size, "encrypted audio size");
   });
 }
 
