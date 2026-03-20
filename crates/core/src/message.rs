@@ -14,21 +14,47 @@ pub enum MessageContent {
         #[serde(skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
         mimetype: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
     },
     File {
         url: String,
         filename: String,
         mimetype: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
     },
     Video {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
         mimetype: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<u64>,
     },
     Audio {
         url: String,
         mimetype: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration: Option<u64>,
     },
     Location {
         latitude: f64,

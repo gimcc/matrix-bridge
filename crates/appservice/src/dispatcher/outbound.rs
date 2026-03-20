@@ -222,20 +222,26 @@ impl Dispatcher {
         };
 
         // Determine content type and filename for re-upload.
-        let (content_type, filename) = match &content {
-            MessageContent::Image { mimetype, .. } => (mimetype.as_str(), "image"),
+        let (content_type, upload_name) = match &content {
+            MessageContent::Image {
+                mimetype, filename, ..
+            } => (mimetype.as_str(), filename.as_deref().unwrap_or("image")),
             MessageContent::File {
                 mimetype, filename, ..
             } => (mimetype.as_str(), filename.as_str()),
-            MessageContent::Video { mimetype, .. } => (mimetype.as_str(), "video"),
-            MessageContent::Audio { mimetype, .. } => (mimetype.as_str(), "audio"),
+            MessageContent::Video {
+                mimetype, filename, ..
+            } => (mimetype.as_str(), filename.as_deref().unwrap_or("video")),
+            MessageContent::Audio {
+                mimetype, filename, ..
+            } => (mimetype.as_str(), filename.as_deref().unwrap_or("audio")),
             _ => ("application/octet-stream", "file"),
         };
 
         // Re-upload as unencrypted plaintext.
         let new_mxc = match self
             .matrix_client
-            .upload_media(plaintext, content_type, filename)
+            .upload_media(plaintext, content_type, upload_name)
             .await
         {
             Ok(uri) => uri,
@@ -262,32 +268,61 @@ impl Dispatcher {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
             } => MessageContent::Image {
                 url: self.mxc_to_http(&url),
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
             },
             MessageContent::File {
                 url,
                 filename,
                 mimetype,
+                size,
             } => MessageContent::File {
                 url: self.mxc_to_http(&url),
                 filename,
                 mimetype,
+                size,
             },
             MessageContent::Video {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
+                duration,
             } => MessageContent::Video {
                 url: self.mxc_to_http(&url),
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
+                duration,
             },
-            MessageContent::Audio { url, mimetype } => MessageContent::Audio {
+            MessageContent::Audio {
+                url,
+                mimetype,
+                filename,
+                size,
+                duration,
+            } => MessageContent::Audio {
                 url: self.mxc_to_http(&url),
                 mimetype,
+                filename,
+                size,
+                duration,
             },
             other => other,
         }
@@ -308,29 +343,64 @@ impl Dispatcher {
     fn replace_media_url(content: MessageContent, new_url: &str) -> MessageContent {
         match content {
             MessageContent::Image {
-                caption, mimetype, ..
+                caption,
+                mimetype,
+                filename,
+                width,
+                height,
+                size,
+                ..
             } => MessageContent::Image {
                 url: new_url.to_string(),
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
             },
             MessageContent::File {
-                filename, mimetype, ..
+                filename,
+                mimetype,
+                size,
+                ..
             } => MessageContent::File {
                 url: new_url.to_string(),
                 filename,
                 mimetype,
+                size,
             },
             MessageContent::Video {
-                caption, mimetype, ..
+                caption,
+                mimetype,
+                filename,
+                width,
+                height,
+                size,
+                duration,
+                ..
             } => MessageContent::Video {
                 url: new_url.to_string(),
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
+                duration,
             },
-            MessageContent::Audio { mimetype, .. } => MessageContent::Audio {
+            MessageContent::Audio {
+                mimetype,
+                filename,
+                size,
+                duration,
+                ..
+            } => MessageContent::Audio {
                 url: new_url.to_string(),
                 mimetype,
+                filename,
+                size,
+                duration,
             },
             other => other,
         }

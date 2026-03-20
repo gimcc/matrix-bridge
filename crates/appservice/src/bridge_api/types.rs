@@ -44,6 +44,14 @@ pub enum ContentPayload {
         caption: Option<String>,
         #[serde(default = "default_image_mime")]
         mimetype: String,
+        #[serde(default)]
+        filename: Option<String>,
+        #[serde(default)]
+        width: Option<u32>,
+        #[serde(default)]
+        height: Option<u32>,
+        #[serde(default)]
+        size: Option<u64>,
     },
     File {
         /// mxc:// URI or external URL.
@@ -51,6 +59,8 @@ pub enum ContentPayload {
         filename: String,
         #[serde(default = "default_file_mime")]
         mimetype: String,
+        #[serde(default)]
+        size: Option<u64>,
     },
     Video {
         /// mxc:// URI or external URL.
@@ -59,12 +69,28 @@ pub enum ContentPayload {
         caption: Option<String>,
         #[serde(default = "default_video_mime")]
         mimetype: String,
+        #[serde(default)]
+        filename: Option<String>,
+        #[serde(default)]
+        width: Option<u32>,
+        #[serde(default)]
+        height: Option<u32>,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        duration: Option<u64>,
     },
     Audio {
         /// mxc:// URI or external URL.
         url: String,
         #[serde(default = "default_audio_mime")]
         mimetype: String,
+        #[serde(default)]
+        filename: Option<String>,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        duration: Option<u64>,
     },
     Location {
         latitude: f64,
@@ -197,30 +223,62 @@ pub(crate) fn convert_content(payload: ContentPayload) -> MessageContent {
             url,
             caption,
             mimetype,
+            filename,
+            width,
+            height,
+            size,
         } => MessageContent::Image {
             url,
             caption,
             mimetype,
+            filename,
+            width,
+            height,
+            size,
         },
         ContentPayload::File {
             url,
             filename,
             mimetype,
+            size,
         } => MessageContent::File {
             url,
             filename,
             mimetype,
+            size,
         },
         ContentPayload::Video {
             url,
             caption,
             mimetype,
+            filename,
+            width,
+            height,
+            size,
+            duration,
         } => MessageContent::Video {
             url,
             caption,
             mimetype,
+            filename,
+            width,
+            height,
+            size,
+            duration,
         },
-        ContentPayload::Audio { url, mimetype } => MessageContent::Audio { url, mimetype },
+        ContentPayload::Audio {
+            url,
+            mimetype,
+            filename,
+            size,
+            duration,
+        } => MessageContent::Audio {
+            url,
+            mimetype,
+            filename,
+            size,
+            duration,
+        },
         ContentPayload::Location {
             latitude,
             longitude,
@@ -380,8 +438,8 @@ mod tests {
 
     #[test]
     fn convert_content_image() {
-        let result = convert_content(ContentPayload::Image { url: "mxc://e/i".into(), caption: Some("photo".into()), mimetype: "image/jpeg".into() });
-        assert!(matches!(result, MessageContent::Image { url, caption, mimetype } if url == "mxc://e/i" && caption.as_deref() == Some("photo") && mimetype == "image/jpeg"));
+        let result = convert_content(ContentPayload::Image { url: "mxc://e/i".into(), caption: Some("photo".into()), mimetype: "image/jpeg".into(), filename: None, width: None, height: None, size: None });
+        assert!(matches!(result, MessageContent::Image { url, caption, mimetype, .. } if url == "mxc://e/i" && caption.as_deref() == Some("photo") && mimetype == "image/jpeg"));
     }
 
     #[test]
@@ -425,19 +483,19 @@ mod tests {
 
     #[test]
     fn convert_content_video() {
-        let result = convert_content(ContentPayload::Video { url: "mxc://e/v".into(), caption: None, mimetype: "video/mp4".into() });
+        let result = convert_content(ContentPayload::Video { url: "mxc://e/v".into(), caption: None, mimetype: "video/mp4".into(), filename: None, width: None, height: None, size: None, duration: None });
         assert!(matches!(result, MessageContent::Video { url, mimetype, .. } if url == "mxc://e/v" && mimetype == "video/mp4"));
     }
 
     #[test]
     fn convert_content_audio() {
-        let result = convert_content(ContentPayload::Audio { url: "mxc://e/a".into(), mimetype: "audio/ogg".into() });
-        assert!(matches!(result, MessageContent::Audio { url, mimetype } if url == "mxc://e/a" && mimetype == "audio/ogg"));
+        let result = convert_content(ContentPayload::Audio { url: "mxc://e/a".into(), mimetype: "audio/ogg".into(), filename: None, size: None, duration: None });
+        assert!(matches!(result, MessageContent::Audio { url, mimetype, .. } if url == "mxc://e/a" && mimetype == "audio/ogg"));
     }
 
     #[test]
     fn convert_content_file() {
-        let result = convert_content(ContentPayload::File { url: "mxc://e/f".into(), filename: "data.csv".into(), mimetype: "text/csv".into() });
-        assert!(matches!(result, MessageContent::File { url, filename, mimetype } if url == "mxc://e/f" && filename == "data.csv" && mimetype == "text/csv"));
+        let result = convert_content(ContentPayload::File { url: "mxc://e/f".into(), filename: "data.csv".into(), mimetype: "text/csv".into(), size: None });
+        assert!(matches!(result, MessageContent::File { url, filename, mimetype, .. } if url == "mxc://e/f" && filename == "data.csv" && mimetype == "text/csv"));
     }
 }

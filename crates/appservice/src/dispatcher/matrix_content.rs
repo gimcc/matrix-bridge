@@ -70,11 +70,13 @@ impl Dispatcher {
             "m.file" => {
                 let (url, encrypted_media, file_encryption) = Self::extract_media_url(content);
                 let mimetype = Self::extract_mimetype(content, "application/octet-stream");
+                let size = content.get("info").and_then(|i| i.get("size")).and_then(|v| v.as_u64());
                 Some(ParsedContent {
                     content: MessageContent::File {
                         url,
                         filename: body.to_string(),
                         mimetype,
+                        size,
                     },
                     encrypted_media,
                     file_encryption,
@@ -84,8 +86,21 @@ impl Dispatcher {
             "m.audio" => {
                 let (url, encrypted_media, file_encryption) = Self::extract_media_url(content);
                 let mimetype = Self::extract_mimetype(content, "audio/ogg");
+                let info = content.get("info");
+                let size = info.and_then(|i| i.get("size")).and_then(|v| v.as_u64());
+                let duration = info.and_then(|i| i.get("duration")).and_then(|v| v.as_u64());
+                let filename = content
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 Some(ParsedContent {
-                    content: MessageContent::Audio { url, mimetype },
+                    content: MessageContent::Audio {
+                        url,
+                        mimetype,
+                        filename,
+                        size,
+                        duration,
+                    },
                     encrypted_media,
                     file_encryption,
                 })
@@ -103,18 +118,36 @@ impl Dispatcher {
         let (url, encrypted_media, file_encryption) = Self::extract_media_url(content);
         let mimetype = Self::extract_mimetype(content, default_mime);
         let caption = Some(body.to_string()).filter(|s| !s.is_empty());
+        let info = content.get("info");
+        let width = info.and_then(|i| i.get("w")).and_then(|v| v.as_u64()).map(|v| v as u32);
+        let height = info.and_then(|i| i.get("h")).and_then(|v| v.as_u64()).map(|v| v as u32);
+        let size = info.and_then(|i| i.get("size")).and_then(|v| v.as_u64());
+        let duration = info.and_then(|i| i.get("duration")).and_then(|v| v.as_u64());
+        let filename = content
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let mc = if is_visual && default_mime.starts_with("video") {
             MessageContent::Video {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
+                duration,
             }
         } else {
             MessageContent::Image {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
             }
         };
         ParsedContent {

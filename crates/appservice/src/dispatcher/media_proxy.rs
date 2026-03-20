@@ -38,13 +38,22 @@ impl Dispatcher {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
             } => {
-                let result = self.ensure_mxc(&url, &mimetype, "image", encrypt).await;
+                let fallback = filename.as_deref().unwrap_or("image");
+                let result = self.ensure_mxc(&url, &mimetype, fallback, encrypt).await;
                 ReuploadResult {
                     content: MessageContent::Image {
                         url: result.mxc_uri,
                         caption,
                         mimetype,
+                        filename,
+                        width,
+                        height,
+                        size,
                     },
                     encrypted_file: result.encrypted,
                 }
@@ -53,6 +62,7 @@ impl Dispatcher {
                 url,
                 filename,
                 mimetype,
+                size,
             } => {
                 let result = self
                     .ensure_mxc_with_filename(&url, &mimetype, &filename, encrypt)
@@ -62,6 +72,7 @@ impl Dispatcher {
                         url: result.mxc_uri,
                         filename,
                         mimetype,
+                        size,
                     },
                     encrypted_file: result.encrypted,
                 }
@@ -70,23 +81,44 @@ impl Dispatcher {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
+                duration,
             } => {
-                let result = self.ensure_mxc(&url, &mimetype, "video", encrypt).await;
+                let fallback = filename.as_deref().unwrap_or("video");
+                let result = self.ensure_mxc(&url, &mimetype, fallback, encrypt).await;
                 ReuploadResult {
                     content: MessageContent::Video {
                         url: result.mxc_uri,
                         caption,
                         mimetype,
+                        filename,
+                        width,
+                        height,
+                        size,
+                        duration,
                     },
                     encrypted_file: result.encrypted,
                 }
             }
-            MessageContent::Audio { url, mimetype } => {
-                let result = self.ensure_mxc(&url, &mimetype, "audio", encrypt).await;
+            MessageContent::Audio {
+                url,
+                mimetype,
+                filename,
+                size,
+                duration,
+            } => {
+                let fallback = filename.as_deref().unwrap_or("audio");
+                let result = self.ensure_mxc(&url, &mimetype, fallback, encrypt).await;
                 ReuploadResult {
                     content: MessageContent::Audio {
                         url: result.mxc_uri,
                         mimetype,
+                        filename,
+                        size,
+                        duration,
                     },
                     encrypted_file: result.encrypted,
                 }

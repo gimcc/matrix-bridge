@@ -42,8 +42,9 @@ impl MatrixClient {
     /// Enforces a maximum download size to prevent unbounded memory allocation.
     pub async fn download_media(&self, mxc_uri: &str) -> anyhow::Result<(Vec<u8>, String)> {
         let (server_name, media_id) = parse_mxc(mxc_uri)?;
+        // Use authenticated media endpoint (Synapse 1.149+).
         let url = format!(
-            "{}/_matrix/media/v3/download/{}/{}",
+            "{}/_matrix/client/v1/media/download/{}/{}",
             self.homeserver_url, server_name, media_id,
         );
 
@@ -94,8 +95,9 @@ impl MatrixClient {
     /// homeserver. External platforms can use this URL to fetch the media.
     pub fn mxc_to_download_url(&self, mxc_uri: &str) -> Option<String> {
         let (server_name, media_id) = parse_mxc(mxc_uri).ok()?;
+        // Use authenticated media endpoint (Synapse 1.149+).
         Some(format!(
-            "{}/_matrix/media/v3/download/{}/{}",
+            "{}/_matrix/client/v1/media/download/{}/{}",
             self.homeserver_url, server_name, media_id,
         ))
     }

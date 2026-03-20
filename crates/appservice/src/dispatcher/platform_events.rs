@@ -240,12 +240,26 @@ impl Dispatcher {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
             } => {
+                let body_text = filename.as_deref()
+                    .or(caption.as_deref())
+                    .unwrap_or("image");
+                let mut info = serde_json::json!({ "mimetype": mimetype });
+                if let Some(w) = width { info["w"] = (*w).into(); }
+                if let Some(h) = height { info["h"] = (*h).into(); }
+                if let Some(s) = size { info["size"] = (*s).into(); }
                 let mut c = serde_json::json!({
                     "msgtype": "m.image",
-                    "body": caption.as_deref().unwrap_or("image"),
-                    "info": { "mimetype": mimetype },
+                    "body": body_text,
+                    "info": info,
                 });
+                if let Some(f) = filename {
+                    c["filename"] = f.clone().into();
+                }
                 apply_media_url(&mut c, url, encrypted_file);
                 c
             }
@@ -253,11 +267,14 @@ impl Dispatcher {
                 url,
                 filename,
                 mimetype,
+                size,
             } => {
+                let mut info = serde_json::json!({ "mimetype": mimetype });
+                if let Some(s) = size { info["size"] = (*s).into(); }
                 let mut c = serde_json::json!({
                     "msgtype": "m.file",
                     "body": filename,
-                    "info": { "mimetype": mimetype },
+                    "info": info,
                 });
                 apply_media_url(&mut c, url, encrypted_file);
                 c
@@ -266,21 +283,50 @@ impl Dispatcher {
                 url,
                 caption,
                 mimetype,
+                filename,
+                width,
+                height,
+                size,
+                duration,
             } => {
+                let body_text = filename.as_deref()
+                    .or(caption.as_deref())
+                    .unwrap_or("video");
+                let mut info = serde_json::json!({ "mimetype": mimetype });
+                if let Some(w) = width { info["w"] = (*w).into(); }
+                if let Some(h) = height { info["h"] = (*h).into(); }
+                if let Some(s) = size { info["size"] = (*s).into(); }
+                if let Some(d) = duration { info["duration"] = (*d).into(); }
                 let mut c = serde_json::json!({
                     "msgtype": "m.video",
-                    "body": caption.as_deref().unwrap_or("video"),
-                    "info": { "mimetype": mimetype },
+                    "body": body_text,
+                    "info": info,
                 });
+                if let Some(f) = filename {
+                    c["filename"] = f.clone().into();
+                }
                 apply_media_url(&mut c, url, encrypted_file);
                 c
             }
-            MessageContent::Audio { url, mimetype } => {
+            MessageContent::Audio {
+                url,
+                mimetype,
+                filename,
+                size,
+                duration,
+            } => {
+                let body_text = filename.as_deref().unwrap_or("audio");
+                let mut info = serde_json::json!({ "mimetype": mimetype });
+                if let Some(s) = size { info["size"] = (*s).into(); }
+                if let Some(d) = duration { info["duration"] = (*d).into(); }
                 let mut c = serde_json::json!({
                     "msgtype": "m.audio",
-                    "body": "audio",
-                    "info": { "mimetype": mimetype },
+                    "body": body_text,
+                    "info": info,
                 });
+                if let Some(f) = filename {
+                    c["filename"] = f.clone().into();
+                }
                 apply_media_url(&mut c, url, encrypted_file);
                 c
             }
